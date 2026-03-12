@@ -186,7 +186,7 @@ def remove_white_edges(input_path, output_path, white_trigger=235):
     return ok
 
 
-def process_directory(input_dir, output_dir, white_trigger=235):
+def process_directory(input_dir, output_dir, white_trigger=235, on_progress=None):
     os.makedirs(output_dir, exist_ok=True)
 
     image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -207,8 +207,11 @@ def process_directory(input_dir, output_dir, white_trigger=235):
         input_path = os.path.join(input_dir, file_name)
         output_name = f"output{index + 1}.png"
         output_path = os.path.join(output_dir, output_name)
-        if remove_white_edges(input_path, output_path, white_trigger=white_trigger):
+        ok = remove_white_edges(input_path, output_path, white_trigger=white_trigger)
+        if ok:
             success_count += 1
+        if on_progress is not None:
+            on_progress(index + 1, total_count, input_path, output_path, ok)
 
     print(f"Processed {success_count}/{total_count} images.")
     return success_count, total_count
