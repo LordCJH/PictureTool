@@ -133,7 +133,29 @@ def wait_for_next_action():
             return "exit"
 
 
-def remove_white_edges(input_path, output_path, white_trigger=235):
+def _clear_selected_points(img, selected_points, color_tolerance):
+    if not selected_points:
+        return
+
+    h, w = img.shape[:2]
+    bgr = np.ascontiguousarray(img[:, :, :3])
+    alpha = img[:, :, 3]
+    lo_diff = (color_tolerance, color_tolerance, color_tolerance)
+    up_diff = (color_tolerance, color_tolerance, color_tolerance)
+    flags = 8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+
+    for x, y in selected_points:
+        if x < 0 or y < 0 or x >= w or y >= h:
+            continue
+        if alpha[y, x] == 0:
+            continue
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(bgr, mask, seedPoint=(x, y), newVal=(0, 0, 0), loDiff=lo_diff, upDiff=up_diff, flags=flags)
+        filled = mask[1:-1, 1:-1] == 255
+        img[filled] = [0, 0, 0, 0]
+
+
+def remove_white_edges(input_path, output_path, white_trigger=235, selected_points=None, color_tolerance=5):
     """Remove white borders by clearing border-connected near-white regions."""
     img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
     if img is None:
@@ -141,9 +163,10 @@ def remove_white_edges(input_path, output_path, white_trigger=235):
         return False
 
     img = ensure_bgra(img)
+    _clear_selected_points(img, selected_points, color_tolerance)
     h, w = img.shape[:2]
 
-    bgr = img[:, :, :3]
+    bgr = np.ascontiguousarray(img[:, :, :3])
     alpha = img[:, :, 3]
     near_white_mask = np.where(
         ((bgr[:, :, 0] > white_trigger)
@@ -186,7 +209,7 @@ def remove_white_edges(input_path, output_path, white_trigger=235):
     return ok
 
 
-def process_directory(input_dir, output_dir, white_trigger=235, on_progress=None):
+def process_directory(input_dir, output_dir, white_trigger=235, selected_points_map=None, color_tolerance=5, on_progress=None):
     os.makedirs(output_dir, exist_ok=True)
 
     image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -203,11 +226,20 @@ def process_directory(input_dir, output_dir, white_trigger=235, on_progress=None
     success_count = 0
     total_count = len(input_files)
 
+    selected_points_map = selected_points_map or {}
+
     for index, file_name in enumerate(input_files):
         input_path = os.path.join(input_dir, file_name)
         output_name = f"output{index + 1}.png"
         output_path = os.path.join(output_dir, output_name)
-        ok = remove_white_edges(input_path, output_path, white_trigger=white_trigger)
+        selected_points = selected_points_map.get(input_path)
+        ok = remove_white_edges(
+            input_path,
+            output_path,
+            white_trigger=white_trigger,
+            selected_points=selected_points,
+            color_tolerance=color_tolerance,
+        )
         if ok:
             success_count += 1
         if on_progress is not None:

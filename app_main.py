@@ -10,7 +10,7 @@ def main():
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_Use96Dpi, True)
     window = MainWindow()
-    window.resize(720, 520)
+    window.resize(1200, 800)
     window.show()
     sys.exit(app.exec())
 
