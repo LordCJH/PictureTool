@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
 )
-from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor
+from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette
 
 from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode
 class ClickableLabel(QLabel):
@@ -120,7 +120,7 @@ class MainWindow(QMainWindow):
         self.preview_label = ClickableLabel("等待预览")
         self.preview_label.setMinimumSize(320, 240)
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("border: 1px solid #999;")
+        self.preview_label.setStyleSheet("border: 1px solid #999; background-color: #8b5a2b;")
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
@@ -379,7 +379,7 @@ class MainWindow(QMainWindow):
         self.preview_label.setPixmap(scaled)
         self.preview_label.setText("")
 
-    def _show_preview(self, image_path):
+    def _show_preview(self, image_path, update_key=True):
         img = read_image_unicode(image_path, cv2.IMREAD_UNCHANGED)
         if img is None:
             self.preview_original_pixmap = None
@@ -405,16 +405,17 @@ class MainWindow(QMainWindow):
 
         self.preview_original_pixmap = QPixmap.fromImage(qimage)
         self.current_image_size = (qimage.width(), qimage.height())
-        self.current_input_path = image_path
-        input_dir = self.input_edit.text().strip()
-        current_key = image_path
-        if input_dir and os.path.isdir(input_dir):
-            candidate = os.path.join(input_dir, os.path.basename(image_path))
-            if os.path.isfile(candidate):
-                current_key = candidate
-        self.current_input_key = current_key
-        if self.current_input_key not in self.selected_points_map:
-            self.selected_points_map[self.current_input_key] = []
+        if update_key:
+            self.current_input_path = image_path
+            input_dir = self.input_edit.text().strip()
+            current_key = image_path
+            if input_dir and os.path.isdir(input_dir):
+                candidate = os.path.join(input_dir, os.path.basename(image_path))
+                if os.path.isfile(candidate):
+                    current_key = candidate
+            self.current_input_key = current_key
+            if self.current_input_key not in self.selected_points_map:
+                self.selected_points_map[self.current_input_key] = []
         self._refresh_preview_scaled()
 
     def resizeEvent(self, event):
@@ -438,8 +439,26 @@ class MainWindow(QMainWindow):
             self.log_dialog.append(message)
 
         preview_path = input_path
+        update_key = True
+        if ok:
+            output_candidate = None
+            if output_path and os.path.isfile(output_path):
+                output_candidate = output_path
+            else:
+                output_dir = self.output_edit.text().strip()
+                if output_dir and os.path.isdir(output_dir):
+                    files = [
+                        os.path.join(output_dir, name)
+                        for name in os.listdir(output_dir)
+                    ]
+                    files = [path for path in files if os.path.isfile(path)]
+                    if files:
+                        output_candidate = max(files, key=os.path.getmtime)
+            if output_candidate:
+                preview_path = output_candidate
+                update_key = False
         if os.path.isfile(preview_path):
-            self._show_preview(preview_path)
+            self._show_preview(preview_path, update_key=update_key)
         else:
             self.preview_original_pixmap = None
             self.current_image_size = None
