@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QDialog,
     QVBoxLayout,
+    QCheckBox,
 )
 from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette
 
@@ -50,13 +51,18 @@ class ProcessWorker(QThread):
     finished = Signal(int, int)
     log = Signal(str)
 
-    def __init__(self, input_dir, output_dir, white_trigger, selected_points_map, color_tolerance, parent=None):
+    def __init__(self, input_dir, output_dir, white_trigger, selected_points_map, color_tolerance, do_remove_white, do_remove_points, do_resize, target_width, target_height, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.white_trigger = white_trigger
         self.selected_points_map = selected_points_map
         self.color_tolerance = color_tolerance
+        self.do_remove_white = do_remove_white
+        self.do_remove_points = do_remove_points
+        self.do_resize = do_resize
+        self.target_width = target_width
+        self.target_height = target_height
 
     def run(self):
         def _on_progress(current, total, input_path, output_path, ok):
@@ -70,6 +76,11 @@ class ProcessWorker(QThread):
                 white_trigger=self.white_trigger,
                 selected_points_map=self.selected_points_map,
                 color_tolerance=self.color_tolerance,
+                do_remove_white=self.do_remove_white,
+                do_remove_points=self.do_remove_points,
+                do_resize=self.do_resize,
+                target_width=self.target_width,
+                target_height=self.target_height,
                 on_progress=_on_progress,
             )
             self.log.emit("目录处理结束")
@@ -117,6 +128,24 @@ class MainWindow(QMainWindow):
 
         self.clear_points_button = QPushButton("清除选点")
 
+        self.remove_white_checkbox = QCheckBox("去除白边")
+        self.remove_white_checkbox.setChecked(True)
+        self.remove_points_checkbox = QCheckBox("选点删除")
+        self.remove_points_checkbox.setChecked(True)
+        self.resize_checkbox = QCheckBox("调整分辨率")
+        self.resize_checkbox.setChecked(False)
+
+        self.resize_width_spin = QSpinBox()
+        self.resize_width_spin.setRange(1, 100000)
+        self.resize_width_spin.setValue(1)
+        self.resize_width_spin.setEnabled(False)
+        self.resize_height_spin = QSpinBox()
+        self.resize_height_spin.setRange(1, 100000)
+        self.resize_height_spin.setValue(1)
+        self.resize_height_spin.setEnabled(False)
+
+        self.resize_checkbox.toggled.connect(self.on_resize_toggled)
+
         self.preview_label = ClickableLabel("等待预览")
         self.preview_label.setMinimumSize(320, 240)
         self.preview_label.setAlignment(Qt.AlignCenter)
@@ -161,10 +190,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("选点容差"), 4, 2)
         layout.addWidget(self.tolerance_spin, 4, 3)
 
+        option_row = QHBoxLayout()
+        option_row.addWidget(self.remove_white_checkbox)
+        option_row.addWidget(self.remove_points_checkbox)
+        option_row.addWidget(self.resize_checkbox)
+        layout.addLayout(option_row, 5, 0, 1, 4)
+
+        resize_row = QHBoxLayout()
+        resize_row.addWidget(QLabel("宽"))
+        resize_row.addWidget(self.resize_width_spin)
+        resize_row.addWidget(QLabel("高"))
+        resize_row.addWidget(self.resize_height_spin)
+        resize_row.addStretch(1)
+        layout.addLayout(resize_row, 6, 0, 1, 4)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.start_button)
-        layout.addLayout(button_row, 6, 0, 1, 4)
+        layout.addLayout(button_row, 7, 0, 1, 4)
 
         self.setCentralWidget(central)
 
@@ -174,6 +216,25 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_processing)
         self.clear_points_button.clicked.connect(self.clear_selected_points)
         self.preview_label.clicked.connect(self.on_preview_clicked)
+
+        # 程序启动时自动加载默认输入目录的第一张图片
+        default_input_dir = self.input_edit.text().strip()
+        if default_input_dir and os.path.isdir(default_input_dir):
+            first_image = self._get_first_image_in_directory(default_input_dir)
+            if first_image:
+                self._show_preview(first_image)
+
+    def on_resize_toggled(self, checked):
+        self.resize_width_spin.setEnabled(checked)
+        self.resize_height_spin.setEnabled(checked)
+        if not checked:
+            return
+        if not self.current_image_size:
+            return
+        if self.resize_width_spin.value() <= 1:
+            self.resize_width_spin.setValue(self.current_image_size[0])
+        if self.resize_height_spin.value() <= 1:
+            self.resize_height_spin.setValue(self.current_image_size[1])
 
     def clear_selected_points(self):
         if not self.current_input_key:
@@ -231,10 +292,29 @@ class MainWindow(QMainWindow):
             points.append((img_x, img_y))
         self._refresh_preview_scaled()
 
+    def _get_first_image_in_directory(self, dir_path):
+        """扫描目录下的图片文件，返回第一张图片的完整路径，如果没有则返回 None。"""
+        if not dir_path or not os.path.isdir(dir_path):
+            return None
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
+        try:
+            for name in os.listdir(dir_path):
+                if name.lower().endswith(image_extensions):
+                    full_path = os.path.join(dir_path, name)
+                    if os.path.isfile(full_path):
+                        return full_path
+        except Exception:
+            pass
+        return None
+
     def select_input_dir(self):
         selected = QFileDialog.getExistingDirectory(self, "选择输入目录", self.input_edit.text())
         if selected:
             self.input_edit.setText(selected)
+            # 自动加载目录下的第一张图片作为预览
+            first_image = self._get_first_image_in_directory(selected)
+            if first_image:
+                self._show_preview(first_image)
 
     def select_output_dir(self):
         selected = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_edit.text())
@@ -306,6 +386,11 @@ class MainWindow(QMainWindow):
             white_trigger,
             selected_points_snapshot,
             color_tolerance,
+            self.remove_white_checkbox.isChecked(),
+            self.remove_points_checkbox.isChecked(),
+            self.resize_checkbox.isChecked(),
+            self.resize_width_spin.value(),
+            self.resize_height_spin.value(),
             self,
         )
         self.worker.progress.connect(self.on_progress)
@@ -405,6 +490,9 @@ class MainWindow(QMainWindow):
 
         self.preview_original_pixmap = QPixmap.fromImage(qimage)
         self.current_image_size = (qimage.width(), qimage.height())
+        # 自动更新分辨率输入框为当前图片尺寸
+        self.resize_width_spin.setValue(self.current_image_size[0])
+        self.resize_height_spin.setValue(self.current_image_size[1])
         if update_key:
             self.current_input_path = image_path
             input_dir = self.input_edit.text().strip()

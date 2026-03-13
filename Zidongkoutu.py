@@ -153,15 +153,30 @@ def _clear_selected_points(img, selected_points, color_tolerance):
         cv2.floodFill(bgr, mask, seedPoint=(x, y), newVal=(0, 0, 0), loDiff=lo_diff, upDiff=up_diff, flags=flags)
         filled = mask[1:-1, 1:-1] == 255
         img[filled] = [0, 0, 0, 0]
+def resize_to_fit(img, max_w, max_h):
+    if max_w <= 0 or max_h <= 0:
+        return img
+
+    h, w = img.shape[:2]
+    if w == 0 or h == 0:
+        return img
+
+    scale = min(max_w / w, max_h / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    if new_w == w and new_h == h:
+        return img
+
+    if scale < 1.0:
+        interp = cv2.INTER_AREA
+    else:
+        interp = cv2.INTER_LINEAR
+
+    return cv2.resize(img, (new_w, new_h), interpolation=interp)
 
 
-def remove_white_edges(input_path, output_path, white_trigger=235, selected_points=None, color_tolerance=5):
-    """Remove white borders by clearing border-connected near-white regions."""
-    img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        print(f"Unable to load image {input_path}")
-        return False
-
+def _remove_white_edges_from_image(img, white_trigger=235, selected_points=None, color_tolerance=5):
     img = ensure_bgra(img)
     _clear_selected_points(img, selected_points, color_tolerance)
     h, w = img.shape[:2]
@@ -200,6 +215,22 @@ def remove_white_edges(input_path, output_path, white_trigger=235, selected_poin
             background_mask[comp] = 255
 
     img[background_mask == 255] = [0, 0, 0, 0]
+    return img
+
+
+def remove_white_edges(input_path, output_path, white_trigger=235, selected_points=None, color_tolerance=5):
+    """Remove white borders by clearing border-connected near-white regions."""
+    img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"Unable to load image {input_path}")
+        return False
+
+    img = _remove_white_edges_from_image(
+        img,
+        white_trigger=white_trigger,
+        selected_points=selected_points,
+        color_tolerance=color_tolerance,
+    )
 
     ok = write_image_unicode(output_path, img)
     if ok:
@@ -209,7 +240,19 @@ def remove_white_edges(input_path, output_path, white_trigger=235, selected_poin
     return ok
 
 
-def process_directory(input_dir, output_dir, white_trigger=235, selected_points_map=None, color_tolerance=5, on_progress=None):
+def process_directory(
+    input_dir,
+    output_dir,
+    white_trigger=235,
+    selected_points_map=None,
+    color_tolerance=5,
+    do_remove_white=True,
+    do_remove_points=True,
+    do_resize=False,
+    target_width=0,
+    target_height=0,
+    on_progress=None,
+):
     os.makedirs(output_dir, exist_ok=True)
 
     image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -233,13 +276,34 @@ def process_directory(input_dir, output_dir, white_trigger=235, selected_points_
         output_name = f"output{index + 1}.png"
         output_path = os.path.join(output_dir, output_name)
         selected_points = selected_points_map.get(input_path)
-        ok = remove_white_edges(
-            input_path,
-            output_path,
-            white_trigger=white_trigger,
-            selected_points=selected_points,
-            color_tolerance=color_tolerance,
-        )
+        ok = True
+
+        img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            ok = False
+        else:
+            img = ensure_bgra(img)
+
+            if do_remove_white:
+                img = _remove_white_edges_from_image(
+                    img,
+                    white_trigger=white_trigger,
+                    selected_points=selected_points,
+                    color_tolerance=color_tolerance,
+                )
+
+            if do_remove_points:
+                _clear_selected_points(img, selected_points, color_tolerance)
+
+            if do_resize:
+                img = resize_to_fit(img, target_width, target_height)
+
+            ok = write_image_unicode(output_path, img)
+            if ok:
+                print(f"Saved to: {output_path}")
+            else:
+                print(f"Failed to save image: {output_path}")
+
         if ok:
             success_count += 1
         if on_progress is not None:
