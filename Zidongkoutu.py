@@ -251,6 +251,7 @@ def process_directory(
     do_resize=False,
     target_width=0,
     target_height=0,
+    keep_original_name=False,
     on_progress=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -273,7 +274,10 @@ def process_directory(
 
     for index, file_name in enumerate(input_files):
         input_path = os.path.join(input_dir, file_name)
-        output_name = f"output{index + 1}.png"
+        if keep_original_name:
+            output_name = file_name
+        else:
+            output_name = f"output{index + 1}.png"
         output_path = os.path.join(output_dir, output_name)
         selected_points = selected_points_map.get(input_path)
         ok = True

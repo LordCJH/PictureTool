@@ -51,7 +51,7 @@ class ProcessWorker(QThread):
     finished = Signal(int, int)
     log = Signal(str)
 
-    def __init__(self, input_dir, output_dir, white_trigger, selected_points_map, color_tolerance, do_remove_white, do_remove_points, do_resize, target_width, target_height, parent=None):
+    def __init__(self, input_dir, output_dir, white_trigger, selected_points_map, color_tolerance, do_remove_white, do_remove_points, do_resize, target_width, target_height, keep_original_name=False, parent=None):
         super().__init__(parent)
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -63,6 +63,7 @@ class ProcessWorker(QThread):
         self.do_resize = do_resize
         self.target_width = target_width
         self.target_height = target_height
+        self.keep_original_name = keep_original_name
 
     def run(self):
         def _on_progress(current, total, input_path, output_path, ok):
@@ -81,6 +82,7 @@ class ProcessWorker(QThread):
                 do_resize=self.do_resize,
                 target_width=self.target_width,
                 target_height=self.target_height,
+                keep_original_name=self.keep_original_name,
                 on_progress=_on_progress,
             )
             self.log.emit("目录处理结束")
@@ -134,6 +136,8 @@ class MainWindow(QMainWindow):
         self.remove_points_checkbox.setChecked(True)
         self.resize_checkbox = QCheckBox("调整分辨率")
         self.resize_checkbox.setChecked(False)
+        self.keep_name_checkbox = QCheckBox("保持原文件名")
+        self.keep_name_checkbox.setChecked(False)
 
         self.resize_width_spin = QSpinBox()
         self.resize_width_spin.setRange(1, 100000)
@@ -194,6 +198,7 @@ class MainWindow(QMainWindow):
         option_row.addWidget(self.remove_white_checkbox)
         option_row.addWidget(self.remove_points_checkbox)
         option_row.addWidget(self.resize_checkbox)
+        option_row.addWidget(self.keep_name_checkbox)
         layout.addLayout(option_row, 5, 0, 1, 4)
 
         resize_row = QHBoxLayout()
@@ -391,6 +396,7 @@ class MainWindow(QMainWindow):
             self.resize_checkbox.isChecked(),
             self.resize_width_spin.value(),
             self.resize_height_spin.value(),
+            self.keep_name_checkbox.isChecked(),
             self,
         )
         self.worker.progress.connect(self.on_progress)
