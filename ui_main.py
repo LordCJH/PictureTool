@@ -230,7 +230,7 @@ class MainWindow(QMainWindow):
 
         base_dir = self._base_dir()
         default_input = os.path.join(base_dir, "Input")
-        default_output = os.path.join(base_dir, "Input")
+        default_output = os.path.join(base_dir, "OutPut")
         self._video_input_dir = os.path.join(base_dir, "VideoInput")
         self.input_edit.setText(default_input)
         self.output_edit.setText(default_output)
@@ -347,6 +347,7 @@ class MainWindow(QMainWindow):
             self.input_button.clicked.disconnect()
             self.input_button.clicked.connect(self.select_input_dir)
             self.input_edit.setText(self._last_batch_input_dir if hasattr(self, '_last_batch_input_dir') else os.path.join(self._base_dir(), "Input"))
+            self.output_edit.setText(os.path.join(self._base_dir(), "OutPut"))
 
             # 显示批量抠图相关控件
             self.threshold_label.setVisible(True)
@@ -381,6 +382,7 @@ class MainWindow(QMainWindow):
             # 视频模式下，默认输入目录为 VideoInput
             if hasattr(self, '_video_input_dir'):
                 self.input_edit.setText(self._video_input_dir)
+            self.output_edit.setText(os.path.join(self._base_dir(), "Input"))
 
             # 隐藏批量抠图相关控件
             self.threshold_label.setVisible(False)
