@@ -55,7 +55,8 @@ class ProcessWorker(QThread):
     def __init__(self, mode, input_dir=None, output_dir=None, white_trigger=235,
                  selected_points_map=None, color_tolerance=5, do_remove_white=True,
                  do_remove_points=True, do_resize=False, target_width=0, target_height=0,
-                 keep_original_name=False, video_path=None, frame_interval=1, parent=None):
+                 keep_original_name=False, video_paths=None, frame_interval=1,
+                 frame_mode="interval", target_frame_count=None, parent=None):
         super().__init__(parent)
         self.mode = mode  # "batch_process" 或 "video_extract"
         # 批量抠图参数
@@ -70,9 +71,11 @@ class ProcessWorker(QThread):
         self.target_width = target_width
         self.target_height = target_height
         self.keep_original_name = keep_original_name
-        # 视频抽帧参数
-        self.video_path = video_path
+        # 视频抽帧参数（支持多个视频）
+        self.video_paths = video_paths or []  # 视频文件路径列表
         self.frame_interval = frame_interval
+        self.frame_mode = frame_mode  # "interval" 或 "count"
+        self.target_frame_count = target_frame_count
 
     def run(self):
         def _on_progress(current, total, input_path, output_path, ok):
@@ -99,15 +102,37 @@ class ProcessWorker(QThread):
                 self.finished.emit(success_count, total_count)
             else:  # video_extract
                 self.log.emit("开始视频抽帧...")
-                saved_count, total_expected = extract_video_frames(
-                    self.video_path,
-                    self.output_dir,
-                    interval_seconds=self.frame_interval,
-                    output_format="png",
-                    on_progress=_on_progress,
-                )
-                self.log.emit("视频抽帧结束")
-                self.finished.emit(saved_count, total_expected)
+                total_saved = 0
+                total_expected = 0
+                for video_path in self.video_paths:
+                    if not os.path.isfile(video_path):
+                        self.log.emit(f"跳过无效视频文件: {video_path}")
+                        continue
+                    self.log.emit(f"处理视频: {os.path.basename(video_path)}")
+                    if self.frame_mode == "count" and self.target_frame_count:
+                        # 按目标帧数抽帧
+                        saved_count, expected, frame_subdir = extract_video_frames(
+                            video_path,
+                            self.output_dir,
+                            target_frame_count=self.target_frame_count,
+                            output_format="png",
+                            on_progress=_on_progress,
+                        )
+                    else:
+                        # 按间隔抽帧
+                        saved_count, expected, frame_subdir = extract_video_frames(
+                            video_path,
+                            self.output_dir,
+                            interval_seconds=self.frame_interval,
+                            output_format="png",
+                            on_progress=_on_progress,
+                        )
+                    total_saved += saved_count
+                    total_expected += expected
+                    if frame_subdir:
+                        self.log.emit(f"  帧已保存到: {frame_subdir}/")
+                self.log.emit(f"视频抽帧结束，共处理 {len(self.video_paths)} 个视频，保存 {total_saved} 帧")
+                self.finished.emit(total_saved, total_expected)
         except Exception as exc:
             self.log.emit(f"处理异常: {exc}")
             self.finished.emit(0, 0)
@@ -142,6 +167,18 @@ class MainWindow(QMainWindow):
         self.frame_interval_spin.setValue(1)
         self.frame_interval_spin.setSuffix(" 秒")
         self.frame_interval_label = QLabel("抽帧间隔")
+
+        # 目标帧数设置
+        self.target_frame_count_spin = QSpinBox()
+        self.target_frame_count_spin.setRange(1, 99999)
+        self.target_frame_count_spin.setValue(30)
+        self.target_frame_count_label = QLabel("目标帧数")
+
+        # 抽帧方式选择（默认按数量抽帧）
+        self.frame_mode_combo = QComboBox()
+        self.frame_mode_combo.addItem("按数量抽帧", "count")
+        self.frame_mode_combo.addItem("按间隔抽帧", "interval")
+        self.frame_mode_combo.currentIndexChanged.connect(self.on_frame_mode_changed)
 
         self.input_edit = QLineEdit()
         self.output_edit = QLineEdit()
@@ -193,7 +230,8 @@ class MainWindow(QMainWindow):
 
         base_dir = self._base_dir()
         default_input = os.path.join(base_dir, "Input")
-        default_output = os.path.join(base_dir, "OutPut")
+        default_output = os.path.join(base_dir, "Input")
+        self._video_input_dir = os.path.join(base_dir, "VideoInput")
         self.input_edit.setText(default_input)
         self.output_edit.setText(default_output)
 
@@ -201,14 +239,20 @@ class MainWindow(QMainWindow):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("功能选择"))
         mode_row.addWidget(self.mode_combo)
+        mode_row.addWidget(self.frame_mode_combo)
         mode_row.addWidget(self.frame_interval_label)
         mode_row.addWidget(self.frame_interval_spin)
+        mode_row.addWidget(self.target_frame_count_label)
+        mode_row.addWidget(self.target_frame_count_spin)
         mode_row.addStretch(1)
         layout.addLayout(mode_row, 0, 0, 1, 4)
 
-        # 抽帧间隔默认隐藏（只在视频抽帧模式显示）
+        # 视频抽帧控件默认隐藏
+        self.frame_mode_combo.setVisible(False)
         self.frame_interval_label.setVisible(False)
         self.frame_interval_spin.setVisible(False)
+        self.target_frame_count_label.setVisible(False)
+        self.target_frame_count_spin.setVisible(False)
 
         layout.addWidget(self.preview_label, 1, 0, 1, 4)
         layout.addWidget(self.progress_bar, 2, 0, 1, 4)
@@ -277,6 +321,22 @@ class MainWindow(QMainWindow):
             if first_image:
                 self._show_preview(first_image)
 
+    def on_frame_mode_changed(self, index):
+        """抽帧方式切换时的回调"""
+        mode = self.frame_mode_combo.currentData()
+        if mode == "interval":
+            # 按间隔抽帧
+            self.frame_interval_label.setVisible(True)
+            self.frame_interval_spin.setVisible(True)
+            self.target_frame_count_label.setVisible(False)
+            self.target_frame_count_spin.setVisible(False)
+        else:
+            # 按数量抽帧
+            self.frame_interval_label.setVisible(False)
+            self.frame_interval_spin.setVisible(False)
+            self.target_frame_count_label.setVisible(True)
+            self.target_frame_count_spin.setVisible(True)
+
     def on_mode_changed(self, index):
         """功能模式切换时的回调"""
         mode = self.mode_combo.currentData()
@@ -303,18 +363,24 @@ class MainWindow(QMainWindow):
             self.clear_points_button.setVisible(True)
 
             # 隐藏视频抽帧相关控件
+            self.frame_mode_combo.setVisible(False)
             self.frame_interval_label.setVisible(False)
             self.frame_interval_spin.setVisible(False)
+            self.target_frame_count_label.setVisible(False)
+            self.target_frame_count_spin.setVisible(False)
         else:
             # 保存当前批量抠图的输入目录
             if self.input_label.text() == "输入目录":
                 self._last_batch_input_dir = self.input_edit.text()
 
             # 视频抽帧模式
-            self.input_label.setText("视频文件")
-            self.input_button.setText("选择视频文件")
+            self.input_label.setText("视频输入")
+            self.input_button.setText("选择视频/目录")
             self.input_button.clicked.disconnect()
-            self.input_button.clicked.connect(self.select_input_video)
+            self.input_button.clicked.connect(self.select_input_video_or_dir)
+            # 视频模式下，默认输入目录为 VideoInput
+            if hasattr(self, '_video_input_dir'):
+                self.input_edit.setText(self._video_input_dir)
 
             # 隐藏批量抠图相关控件
             self.threshold_label.setVisible(False)
@@ -331,8 +397,9 @@ class MainWindow(QMainWindow):
             self.clear_points_button.setVisible(False)
 
             # 显示视频抽帧相关控件
-            self.frame_interval_label.setVisible(True)
-            self.frame_interval_spin.setVisible(True)
+            self.frame_mode_combo.setVisible(True)
+            # 根据当前抽帧方式显示对应控件（默认按数量抽帧）
+            self.on_frame_mode_changed(self.frame_mode_combo.currentIndex())
 
     def _base_dir(self):
         return os.path.dirname(
@@ -407,6 +474,22 @@ class MainWindow(QMainWindow):
             points.append((img_x, img_y))
         self._refresh_preview_scaled()
 
+    def _get_video_files_in_directory(self, dir_path):
+        """扫描目录下的视频文件，返回所有视频文件路径列表"""
+        if not dir_path or not os.path.isdir(dir_path):
+            return []
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm')
+        video_files = []
+        try:
+            for name in os.listdir(dir_path):
+                if name.lower().endswith(video_extensions):
+                    full_path = os.path.join(dir_path, name)
+                    if os.path.isfile(full_path):
+                        video_files.append(full_path)
+        except Exception:
+            pass
+        return sorted(video_files)
+
     def _get_first_image_in_directory(self, dir_path):
         """扫描目录下的图片文件，返回第一张图片的完整路径，如果没有则返回 None。"""
         if not dir_path or not os.path.isdir(dir_path):
@@ -432,7 +515,11 @@ class MainWindow(QMainWindow):
                 self._show_preview(first_image)
 
     def select_input_video(self):
-        start_dir = os.path.dirname(self.input_edit.text()) if self.input_edit.text() else self._base_dir()
+        # 视频模式默认从 VideoInput 目录开始
+        if hasattr(self, '_video_input_dir') and os.path.isdir(self._video_input_dir):
+            start_dir = self._video_input_dir
+        else:
+            start_dir = os.path.dirname(self.input_edit.text()) if self.input_edit.text() else self._base_dir()
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择视频文件",
@@ -441,6 +528,31 @@ class MainWindow(QMainWindow):
         )
         if file_path:
             self.input_edit.setText(file_path)
+
+    def select_input_video_or_dir(self):
+        """选择视频文件或目录（供视频抽帧模式使用）"""
+        # 先尝试选择目录
+        current_path = self.input_edit.text().strip()
+        if current_path and os.path.isdir(current_path):
+            start_dir = current_path
+        elif hasattr(self, '_video_input_dir') and os.path.isdir(self._video_input_dir):
+            start_dir = self._video_input_dir
+        else:
+            start_dir = self._base_dir()
+
+        selected_dir = QFileDialog.getExistingDirectory(self, "选择视频目录（或取消选择单个视频）", start_dir)
+        if selected_dir:
+            self.input_edit.setText(selected_dir)
+        else:
+            # 用户取消目录选择，则选择单个视频文件
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择视频文件",
+                start_dir,
+                "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.webm);;All Files (*)",
+            )
+            if file_path:
+                self.input_edit.setText(file_path)
 
     def select_output_dir(self):
         selected = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_edit.text())
@@ -534,19 +646,48 @@ class MainWindow(QMainWindow):
                 parent=self,
             )
         else:  # video_extract
-            if not input_path or not os.path.isfile(input_path):
-                self.log_dialog.append("请选择有效的视频文件")
+            video_files = []
+            if not input_path:
+                # 使用默认 VideoInput 目录
+                if hasattr(self, '_video_input_dir') and os.path.isdir(self._video_input_dir):
+                    input_path = self._video_input_dir
+                else:
+                    self.log_dialog.append("请选择视频文件或输入目录")
+                    self.start_button.setEnabled(True)
+                    self.input_button.setEnabled(True)
+                    self.output_button.setEnabled(True)
+                    return
+
+            if os.path.isfile(input_path):
+                # 单个视频文件
+                video_files = [input_path]
+            elif os.path.isdir(input_path):
+                # 目录，扫描所有视频文件
+                video_files = self._get_video_files_in_directory(input_path)
+                if not video_files:
+                    self.log_dialog.append(f"目录中未找到视频文件: {input_path}")
+                    self.start_button.setEnabled(True)
+                    self.input_button.setEnabled(True)
+                    self.output_button.setEnabled(True)
+                    return
+                self.log_dialog.append(f"找到 {len(video_files)} 个视频文件")
+            else:
+                self.log_dialog.append(f"无效的视频输入路径: {input_path}")
                 self.start_button.setEnabled(True)
                 self.input_button.setEnabled(True)
                 self.output_button.setEnabled(True)
                 return
 
+            frame_mode = self.frame_mode_combo.currentData()
             frame_interval = self.frame_interval_spin.value()
+            target_frame_count = self.target_frame_count_spin.value()
             self.worker = ProcessWorker(
                 mode="video_extract",
                 output_dir=output_dir,
-                video_path=input_path,
+                video_paths=video_files,
                 frame_interval=frame_interval,
+                frame_mode=frame_mode,
+                target_frame_count=target_frame_count,
                 parent=self,
             )
 

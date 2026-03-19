@@ -317,10 +317,22 @@ def process_directory(
     return success_count, total_count
 
 
+def _get_next_frame_subdir(output_dir):
+    """获取下一个可用的 frameN 子目录名"""
+    index = 1
+    while True:
+        subdir_name = f"frame{index}"
+        subdir_path = os.path.join(output_dir, subdir_name)
+        if not os.path.exists(subdir_path):
+            return subdir_path, subdir_name
+        index += 1
+
+
 def extract_video_frames(
     video_path,
     output_dir,
     interval_seconds=1.0,
+    target_frame_count=None,
     output_format="png",
     on_progress=None,
 ):
@@ -329,35 +341,45 @@ def extract_video_frames(
     Args:
         video_path: 视频文件路径
         output_dir: 输出目录
-        interval_seconds: 抽帧间隔（秒），默认1秒
+        interval_seconds: 抽帧间隔（秒），默认1秒，当 target_frame_count 设置时优先使用目标帧数
+        target_frame_count: 目标抽帧数量，若设置则按此数量均匀抽帧
         output_format: 输出图片格式，默认png
         on_progress: 进度回调函数 (current, total, input_path, output_path, ok)
 
     Returns:
-        (saved_count, total_expected): 实际保存帧数, 预期总帧数
+        (saved_count, total_expected, frame_subdir): 实际保存帧数, 预期总帧数, 使用的子目录名
     """
     if not os.path.isfile(video_path):
         print(f"视频文件不存在: {video_path}")
-        return 0, 0
+        return 0, 0, None
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"无法打开视频文件: {video_path}")
-        return 0, 0
+        return 0, 0, None
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
 
-    # 计算帧间隔（每隔多少帧抽一张）
-    frame_interval = int(fps * interval_seconds)
-    if frame_interval < 1:
-        frame_interval = 1
+    # 计算帧间隔
+    if target_frame_count and target_frame_count > 0:
+        # 按目标帧数均匀抽帧
+        total_expected = target_frame_count
+        # 计算间隔帧数，确保能抽到目标数量
+        frame_interval = max(1, int(total_frames / target_frame_count))
+    else:
+        # 按时间间隔抽帧
+        frame_interval = int(fps * interval_seconds)
+        if frame_interval < 1:
+            frame_interval = 1
+        total_expected = int(duration / interval_seconds) + 1 if interval_seconds > 0 else 0
 
-    # 计算预期保存的总帧数
-    total_expected = int(duration / interval_seconds) + 1 if interval_seconds > 0 else 0
-
+    # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
+    # 获取并创建 frameN 子目录
+    frame_subdir_path, frame_subdir_name = _get_next_frame_subdir(output_dir)
+    os.makedirs(frame_subdir_path, exist_ok=True)
 
     saved_count = 0
     frame_pos = 0
@@ -366,14 +388,18 @@ def extract_video_frames(
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
     while True:
+        # 如果已达到目标帧数，停止抽帧
+        if target_frame_count and saved_count >= target_frame_count:
+            break
+
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
         success, frame = cap.read()
         if not success:
             break
 
-        # 生成输出文件名
+        # 生成输出文件名（保存在 frameN 子目录下）
         output_name = f"{video_name}_frame_{saved_count:04d}.{output_format}"
-        output_path = os.path.join(output_dir, output_name)
+        output_path = os.path.join(frame_subdir_path, output_name)
 
         # 转换BGR到BGRA
         if len(frame.shape) == 2:
@@ -399,8 +425,8 @@ def extract_video_frames(
             break
 
     cap.release()
-    print(f"视频抽帧完成: 共保存 {saved_count} 帧")
-    return saved_count, total_expected
+    print(f"视频抽帧完成: 共保存 {saved_count} 帧到 {frame_subdir_path}")
+    return saved_count, total_expected, frame_subdir_name
 
 
 if __name__ == "__main__":
