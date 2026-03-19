@@ -5,6 +5,7 @@ import cv2
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QRect
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette
 
-from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode
+from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode, extract_video_frames
 class ClickableLabel(QLabel):
     clicked = Signal(QPoint, Qt.MouseButton)
 
@@ -51,12 +52,17 @@ class ProcessWorker(QThread):
     finished = Signal(int, int)
     log = Signal(str)
 
-    def __init__(self, input_dir, output_dir, white_trigger, selected_points_map, color_tolerance, do_remove_white, do_remove_points, do_resize, target_width, target_height, keep_original_name=False, parent=None):
+    def __init__(self, mode, input_dir=None, output_dir=None, white_trigger=235,
+                 selected_points_map=None, color_tolerance=5, do_remove_white=True,
+                 do_remove_points=True, do_resize=False, target_width=0, target_height=0,
+                 keep_original_name=False, video_path=None, frame_interval=1, parent=None):
         super().__init__(parent)
+        self.mode = mode  # "batch_process" 或 "video_extract"
+        # 批量抠图参数
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.white_trigger = white_trigger
-        self.selected_points_map = selected_points_map
+        self.selected_points_map = selected_points_map or {}
         self.color_tolerance = color_tolerance
         self.do_remove_white = do_remove_white
         self.do_remove_points = do_remove_points
@@ -64,29 +70,44 @@ class ProcessWorker(QThread):
         self.target_width = target_width
         self.target_height = target_height
         self.keep_original_name = keep_original_name
+        # 视频抽帧参数
+        self.video_path = video_path
+        self.frame_interval = frame_interval
 
     def run(self):
         def _on_progress(current, total, input_path, output_path, ok):
             self.progress.emit(current, total, input_path, output_path, ok)
 
         try:
-            self.log.emit("开始处理目录...")
-            success_count, total_count = process_directory(
-                self.input_dir,
-                self.output_dir,
-                white_trigger=self.white_trigger,
-                selected_points_map=self.selected_points_map,
-                color_tolerance=self.color_tolerance,
-                do_remove_white=self.do_remove_white,
-                do_remove_points=self.do_remove_points,
-                do_resize=self.do_resize,
-                target_width=self.target_width,
-                target_height=self.target_height,
-                keep_original_name=self.keep_original_name,
-                on_progress=_on_progress,
-            )
-            self.log.emit("目录处理结束")
-            self.finished.emit(success_count, total_count)
+            if self.mode == "batch_process":
+                self.log.emit("开始批量抠图...")
+                success_count, total_count = process_directory(
+                    self.input_dir,
+                    self.output_dir,
+                    white_trigger=self.white_trigger,
+                    selected_points_map=self.selected_points_map,
+                    color_tolerance=self.color_tolerance,
+                    do_remove_white=self.do_remove_white,
+                    do_remove_points=self.do_remove_points,
+                    do_resize=self.do_resize,
+                    target_width=self.target_width,
+                    target_height=self.target_height,
+                    keep_original_name=self.keep_original_name,
+                    on_progress=_on_progress,
+                )
+                self.log.emit("批量抠图结束")
+                self.finished.emit(success_count, total_count)
+            else:  # video_extract
+                self.log.emit("开始视频抽帧...")
+                saved_count, total_expected = extract_video_frames(
+                    self.video_path,
+                    self.output_dir,
+                    interval_seconds=self.frame_interval,
+                    output_format="png",
+                    on_progress=_on_progress,
+                )
+                self.log.emit("视频抽帧结束")
+                self.finished.emit(saved_count, total_expected)
         except Exception as exc:
             self.log.emit(f"处理异常: {exc}")
             self.finished.emit(0, 0)
@@ -108,6 +129,19 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         layout = QGridLayout(central)
         self.main_layout = layout
+
+        # 功能选择
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("批量抠图", "batch_process")
+        self.mode_combo.addItem("视频抽帧", "video_extract")
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
+
+        # 抽帧间隔设置
+        self.frame_interval_spin = QSpinBox()
+        self.frame_interval_spin.setRange(1, 3600)
+        self.frame_interval_spin.setValue(1)
+        self.frame_interval_spin.setSuffix(" 秒")
+        self.frame_interval_label = QLabel("抽帧间隔")
 
         self.input_edit = QLineEdit()
         self.output_edit = QLineEdit()
@@ -157,49 +191,63 @@ class MainWindow(QMainWindow):
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
-        base_dir = os.path.dirname(
-            os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
-        )
+        base_dir = self._base_dir()
         default_input = os.path.join(base_dir, "Input")
-        default_output = os.path.join(base_dir, "Output")
+        default_output = os.path.join(base_dir, "OutPut")
         self.input_edit.setText(default_input)
         self.output_edit.setText(default_output)
 
-        layout.addWidget(self.preview_label, 0, 0, 1, 4)
-        layout.addWidget(self.progress_bar, 1, 0, 1, 4)
+        # 功能选择行
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("功能选择"))
+        mode_row.addWidget(self.mode_combo)
+        mode_row.addWidget(self.frame_interval_label)
+        mode_row.addWidget(self.frame_interval_spin)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row, 0, 0, 1, 4)
 
-        layout.setRowStretch(0, 1)
-        layout.setRowStretch(5, 0)
+        # 抽帧间隔默认隐藏（只在视频抽帧模式显示）
+        self.frame_interval_label.setVisible(False)
+        self.frame_interval_spin.setVisible(False)
+
+        layout.addWidget(self.preview_label, 1, 0, 1, 4)
+        layout.addWidget(self.progress_bar, 2, 0, 1, 4)
+
+        layout.setRowStretch(1, 1)
+        layout.setRowStretch(6, 0)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(0, 0)
         layout.setColumnStretch(2, 0)
         layout.setColumnStretch(3, 0)
 
-        layout.addWidget(QLabel("输入目录"), 2, 0)
-        layout.addWidget(self.input_edit, 2, 1)
-        layout.addWidget(self.input_button, 2, 2)
+        self.input_label = QLabel("输入目录")
+        layout.addWidget(self.input_label, 3, 0)
+        layout.addWidget(self.input_edit, 3, 1)
+        layout.addWidget(self.input_button, 3, 2)
 
         point_row = QHBoxLayout()
         point_row.addWidget(self.image_button)
         point_row.addWidget(self.clear_points_button)
-        layout.addLayout(point_row, 2, 3)
+        layout.addLayout(point_row, 3, 3)
 
-        layout.addWidget(QLabel("输出目录"), 3, 0)
-        layout.addWidget(self.output_edit, 3, 1, 1, 2)
-        layout.addWidget(self.output_button, 3, 3)
+        layout.addWidget(QLabel("输出目录"), 4, 0)
+        layout.addWidget(self.output_edit, 4, 1, 1, 2)
+        layout.addWidget(self.output_button, 4, 3)
 
-        layout.addWidget(QLabel("白色阈值"), 4, 0)
-        layout.addWidget(self.threshold_spin, 4, 1)
+        self.threshold_label = QLabel("白色阈值")
+        layout.addWidget(self.threshold_label, 5, 0)
+        layout.addWidget(self.threshold_spin, 5, 1)
 
-        layout.addWidget(QLabel("选点容差"), 4, 2)
-        layout.addWidget(self.tolerance_spin, 4, 3)
+        self.tolerance_label = QLabel("选点容差")
+        layout.addWidget(self.tolerance_label, 5, 2)
+        layout.addWidget(self.tolerance_spin, 5, 3)
 
         option_row = QHBoxLayout()
         option_row.addWidget(self.remove_white_checkbox)
         option_row.addWidget(self.remove_points_checkbox)
         option_row.addWidget(self.resize_checkbox)
         option_row.addWidget(self.keep_name_checkbox)
-        layout.addLayout(option_row, 5, 0, 1, 4)
+        layout.addLayout(option_row, 6, 0, 1, 4)
 
         resize_row = QHBoxLayout()
         resize_row.addWidget(QLabel("宽"))
@@ -207,11 +255,11 @@ class MainWindow(QMainWindow):
         resize_row.addWidget(QLabel("高"))
         resize_row.addWidget(self.resize_height_spin)
         resize_row.addStretch(1)
-        layout.addLayout(resize_row, 6, 0, 1, 4)
+        layout.addLayout(resize_row, 7, 0, 1, 4)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.start_button)
-        layout.addLayout(button_row, 7, 0, 1, 4)
+        layout.addLayout(button_row, 8, 0, 1, 4)
 
         self.setCentralWidget(central)
 
@@ -228,6 +276,68 @@ class MainWindow(QMainWindow):
             first_image = self._get_first_image_in_directory(default_input_dir)
             if first_image:
                 self._show_preview(first_image)
+
+    def on_mode_changed(self, index):
+        """功能模式切换时的回调"""
+        mode = self.mode_combo.currentData()
+        if mode == "batch_process":
+            # 批量抠图模式
+            self.input_label.setText("输入目录")
+            self.input_button.setText("选择输入目录")
+            self.input_button.clicked.disconnect()
+            self.input_button.clicked.connect(self.select_input_dir)
+            self.input_edit.setText(self._last_batch_input_dir if hasattr(self, '_last_batch_input_dir') else os.path.join(self._base_dir(), "Input"))
+
+            # 显示批量抠图相关控件
+            self.threshold_label.setVisible(True)
+            self.threshold_spin.setVisible(True)
+            self.tolerance_label.setVisible(True)
+            self.tolerance_spin.setVisible(True)
+            self.remove_white_checkbox.setVisible(True)
+            self.remove_points_checkbox.setVisible(True)
+            self.resize_checkbox.setVisible(True)
+            self.keep_name_checkbox.setVisible(True)
+            # 根据复选框状态显示/隐藏分辨率设置
+            self.on_resize_toggled(self.resize_checkbox.isChecked())
+            self.image_button.setVisible(True)
+            self.clear_points_button.setVisible(True)
+
+            # 隐藏视频抽帧相关控件
+            self.frame_interval_label.setVisible(False)
+            self.frame_interval_spin.setVisible(False)
+        else:
+            # 保存当前批量抠图的输入目录
+            if self.input_label.text() == "输入目录":
+                self._last_batch_input_dir = self.input_edit.text()
+
+            # 视频抽帧模式
+            self.input_label.setText("视频文件")
+            self.input_button.setText("选择视频文件")
+            self.input_button.clicked.disconnect()
+            self.input_button.clicked.connect(self.select_input_video)
+
+            # 隐藏批量抠图相关控件
+            self.threshold_label.setVisible(False)
+            self.threshold_spin.setVisible(False)
+            self.tolerance_label.setVisible(False)
+            self.tolerance_spin.setVisible(False)
+            self.remove_white_checkbox.setVisible(False)
+            self.remove_points_checkbox.setVisible(False)
+            self.resize_checkbox.setVisible(False)
+            self.keep_name_checkbox.setVisible(False)
+            self.resize_width_spin.setVisible(False)
+            self.resize_height_spin.setVisible(False)
+            self.image_button.setVisible(False)
+            self.clear_points_button.setVisible(False)
+
+            # 显示视频抽帧相关控件
+            self.frame_interval_label.setVisible(True)
+            self.frame_interval_spin.setVisible(True)
+
+    def _base_dir(self):
+        return os.path.dirname(
+            os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
+        )
 
     def on_resize_toggled(self, checked):
         self.resize_width_spin.setEnabled(checked)
@@ -321,6 +431,17 @@ class MainWindow(QMainWindow):
             if first_image:
                 self._show_preview(first_image)
 
+    def select_input_video(self):
+        start_dir = os.path.dirname(self.input_edit.text()) if self.input_edit.text() else self._base_dir()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择视频文件",
+            start_dir,
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.wmv *.webm);;All Files (*)",
+        )
+        if file_path:
+            self.input_edit.setText(file_path)
+
     def select_output_dir(self):
         selected = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_edit.text())
         if selected:
@@ -341,21 +462,15 @@ class MainWindow(QMainWindow):
         self._show_preview(file_path)
 
     def start_processing(self):
-        input_dir = self.input_edit.text().strip()
+        mode = self.mode_combo.currentData()
+        input_path = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
 
-        if self.current_input_path and input_dir and not os.path.commonpath([self.current_input_path, input_dir]) == input_dir:
-            if self.log_dialog:
-                self.log_dialog.append("当前预览图片不在输入目录内，将按文件名匹配输入目录图片")
-
-        if not input_dir or not os.path.isdir(input_dir):
-            if self.log_dialog:
-                self.log_dialog.append("请输入有效的输入目录")
-            return
-
         if not output_dir or not os.path.isdir(output_dir):
-            if self.log_dialog:
-                self.log_dialog.append("请输入有效的输出目录")
+            if self.log_dialog is None:
+                self.log_dialog = LogDialog(self)
+            self.log_dialog.append("请输入有效的输出目录")
+            self.log_dialog.show()
             return
 
         self.progress_bar.setValue(0)
@@ -369,8 +484,10 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.input_button.setEnabled(False)
         self.output_button.setEnabled(False)
-        self.image_button.setEnabled(False)
-        self.clear_points_button.setEnabled(False)
+        if self.image_button.isVisible():
+            self.image_button.setEnabled(False)
+        if self.clear_points_button.isVisible():
+            self.clear_points_button.setEnabled(False)
 
         if self.log_dialog is None:
             self.log_dialog = LogDialog(self)
@@ -379,26 +496,60 @@ class MainWindow(QMainWindow):
         self.log_dialog.show()
         self.log_dialog.raise_()
 
-        white_trigger = self.threshold_spin.value()
-        color_tolerance = self.tolerance_spin.value()
-        selected_points_snapshot = self._resolve_selected_points(input_dir)
-        if not selected_points_snapshot:
-            self.log_dialog.append("提示: 当前没有选点，未传入选点清理")
+        if mode == "batch_process":
+            input_dir = input_path
+            if not input_dir or not os.path.isdir(input_dir):
+                self.log_dialog.append("请输入有效的输入目录")
+                self.start_button.setEnabled(True)
+                self.input_button.setEnabled(True)
+                self.output_button.setEnabled(True)
+                if self.image_button.isVisible():
+                    self.image_button.setEnabled(True)
+                if self.clear_points_button.isVisible():
+                    self.clear_points_button.setEnabled(True)
+                return
 
-        self.worker = ProcessWorker(
-            input_dir,
-            output_dir,
-            white_trigger,
-            selected_points_snapshot,
-            color_tolerance,
-            self.remove_white_checkbox.isChecked(),
-            self.remove_points_checkbox.isChecked(),
-            self.resize_checkbox.isChecked(),
-            self.resize_width_spin.value(),
-            self.resize_height_spin.value(),
-            self.keep_name_checkbox.isChecked(),
-            self,
-        )
+            if self.current_input_path and input_dir and not os.path.commonpath([self.current_input_path, input_dir]) == input_dir:
+                self.log_dialog.append("当前预览图片不在输入目录内，将按文件名匹配输入目录图片")
+
+            white_trigger = self.threshold_spin.value()
+            color_tolerance = self.tolerance_spin.value()
+            selected_points_snapshot = self._resolve_selected_points(input_dir)
+            if not selected_points_snapshot:
+                self.log_dialog.append("提示: 当前没有选点，未传入选点清理")
+
+            self.worker = ProcessWorker(
+                mode="batch_process",
+                input_dir=input_dir,
+                output_dir=output_dir,
+                white_trigger=white_trigger,
+                selected_points_map=selected_points_snapshot,
+                color_tolerance=color_tolerance,
+                do_remove_white=self.remove_white_checkbox.isChecked(),
+                do_remove_points=self.remove_points_checkbox.isChecked(),
+                do_resize=self.resize_checkbox.isChecked(),
+                target_width=self.resize_width_spin.value(),
+                target_height=self.resize_height_spin.value(),
+                keep_original_name=self.keep_name_checkbox.isChecked(),
+                parent=self,
+            )
+        else:  # video_extract
+            if not input_path or not os.path.isfile(input_path):
+                self.log_dialog.append("请选择有效的视频文件")
+                self.start_button.setEnabled(True)
+                self.input_button.setEnabled(True)
+                self.output_button.setEnabled(True)
+                return
+
+            frame_interval = self.frame_interval_spin.value()
+            self.worker = ProcessWorker(
+                mode="video_extract",
+                output_dir=output_dir,
+                video_path=input_path,
+                frame_interval=frame_interval,
+                parent=self,
+            )
+
         self.worker.progress.connect(self.on_progress)
         self.worker.finished.connect(self.on_finished)
         self.worker.log.connect(self.on_worker_log)
@@ -532,6 +683,11 @@ class MainWindow(QMainWindow):
         if self.log_dialog:
             self.log_dialog.append(message)
 
+        # 视频抽帧模式下不更新预览（输出帧会很多）
+        mode = self.mode_combo.currentData()
+        if mode == "video_extract":
+            return
+
         preview_path = input_path
         update_key = True
         if ok:
@@ -566,8 +722,10 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.input_button.setEnabled(True)
         self.output_button.setEnabled(True)
-        self.image_button.setEnabled(True)
-        self.clear_points_button.setEnabled(True)
+        if self.image_button.isVisible():
+            self.image_button.setEnabled(True)
+        if self.clear_points_button.isVisible():
+            self.clear_points_button.setEnabled(True)
         self.worker = None
         if self.log_dialog:
             self.log_dialog.append(f"处理完成：{success_count}/{total_count}")

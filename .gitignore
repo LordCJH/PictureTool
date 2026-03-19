@@ -2,8 +2,9 @@
 PictureCleaner*
 TestPic
 build
-Input/*
-Output/*
-OutPut/*
+Input/
+Output/
+OutPut/
+VideoInput/
 
 

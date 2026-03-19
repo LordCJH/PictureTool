@@ -317,6 +317,92 @@ def process_directory(
     return success_count, total_count
 
 
+def extract_video_frames(
+    video_path,
+    output_dir,
+    interval_seconds=1.0,
+    output_format="png",
+    on_progress=None,
+):
+    """从视频中按间隔抽帧并保存为图片
+
+    Args:
+        video_path: 视频文件路径
+        output_dir: 输出目录
+        interval_seconds: 抽帧间隔（秒），默认1秒
+        output_format: 输出图片格式，默认png
+        on_progress: 进度回调函数 (current, total, input_path, output_path, ok)
+
+    Returns:
+        (saved_count, total_expected): 实际保存帧数, 预期总帧数
+    """
+    if not os.path.isfile(video_path):
+        print(f"视频文件不存在: {video_path}")
+        return 0, 0
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"无法打开视频文件: {video_path}")
+        return 0, 0
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+
+    # 计算帧间隔（每隔多少帧抽一张）
+    frame_interval = int(fps * interval_seconds)
+    if frame_interval < 1:
+        frame_interval = 1
+
+    # 计算预期保存的总帧数
+    total_expected = int(duration / interval_seconds) + 1 if interval_seconds > 0 else 0
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_count = 0
+    frame_pos = 0
+
+    # 获取视频文件名（不含扩展名）作为前缀
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+
+    while True:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+        success, frame = cap.read()
+        if not success:
+            break
+
+        # 生成输出文件名
+        output_name = f"{video_name}_frame_{saved_count:04d}.{output_format}"
+        output_path = os.path.join(output_dir, output_name)
+
+        # 转换BGR到BGRA
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
+        elif frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+
+        # 保存帧
+        ok = write_image_unicode(output_path, frame)
+        if ok:
+            saved_count += 1
+            print(f"保存帧: {output_path}")
+        else:
+            print(f"保存失败: {output_path}")
+
+        if on_progress is not None:
+            on_progress(saved_count, total_expected, video_path, output_path, ok)
+
+        frame_pos += frame_interval
+
+        # 防止无限循环（如果视频没有正确结束）
+        if frame_pos >= total_frames:
+            break
+
+    cap.release()
+    print(f"视频抽帧完成: 共保存 {saved_count} 帧")
+    return saved_count, total_expected
+
+
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(
         sys.executable if getattr(sys, "frozen", False) else __file__
