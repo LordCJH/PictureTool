@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette
 
-from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode, extract_video_frames
+from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode, extract_video_frames, batch_rename_images
 class ClickableLabel(QLabel):
     clicked = Signal(QPoint, Qt.MouseButton)
 
@@ -56,9 +56,13 @@ class ProcessWorker(QThread):
                  selected_points_map=None, color_tolerance=5, do_remove_white=True,
                  do_remove_points=True, do_resize=False, target_width=0, target_height=0,
                  keep_original_name=False, video_paths=None, frame_interval=1,
-                 frame_mode="interval", target_frame_count=None, parent=None):
+                 frame_mode="interval", target_frame_count=None,
+                 rename_prefix='Output', rename_start_num=1, parent=None):
         super().__init__(parent)
-        self.mode = mode  # "batch_process" 或 "video_extract"
+        self.mode = mode  # "batch_process"、"video_extract" 或 "batch_rename"
+        # 批量重命名参数
+        self.rename_prefix = rename_prefix
+        self.rename_start_num = rename_start_num
         # 批量抠图参数
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -100,7 +104,7 @@ class ProcessWorker(QThread):
                 )
                 self.log.emit("批量抠图结束")
                 self.finished.emit(success_count, total_count)
-            else:  # video_extract
+            elif self.mode == "video_extract":
                 self.log.emit("开始视频抽帧...")
                 total_saved = 0
                 total_expected = 0
@@ -133,6 +137,17 @@ class ProcessWorker(QThread):
                         self.log.emit(f"  帧已保存到: {frame_subdir}/")
                 self.log.emit(f"视频抽帧结束，共处理 {len(self.video_paths)} 个视频，保存 {total_saved} 帧")
                 self.finished.emit(total_saved, total_expected)
+            elif self.mode == 'batch_rename':
+                self.log.emit("开始批量重命名...")
+                success, total = batch_rename_images(
+                    self.input_dir,
+                    self.rename_prefix,
+                    self.rename_start_num,
+                    on_progress=lambda cur, tot, old, new, ok:
+                        self.progress.emit(cur, tot, old, new, ok)
+                )
+                self.log.emit(f"批量重命名结束，共重命名 {success}/{total} 个文件")
+                self.finished.emit(success, total)
         except Exception as exc:
             self.log.emit(f"处理异常: {exc}")
             self.finished.emit(0, 0)
@@ -159,6 +174,7 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("批量抠图", "batch_process")
         self.mode_combo.addItem("视频抽帧", "video_extract")
+        self.mode_combo.addItem("批量重命名", "batch_rename")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
 
         # 抽帧间隔设置
@@ -232,6 +248,7 @@ class MainWindow(QMainWindow):
         default_input = os.path.join(base_dir, "Input")
         default_output = os.path.join(base_dir, "OutPut")
         self._video_input_dir = os.path.join(base_dir, "VideoInput")
+        self._rename_target_dir = os.path.join(base_dir, "OutPut")
         self.input_edit.setText(default_input)
         self.output_edit.setText(default_output)
 
@@ -274,7 +291,8 @@ class MainWindow(QMainWindow):
         point_row.addWidget(self.clear_points_button)
         layout.addLayout(point_row, 3, 3)
 
-        layout.addWidget(QLabel("输出目录"), 4, 0)
+        self.output_label = QLabel("输出目录")
+        layout.addWidget(self.output_label, 4, 0)
         layout.addWidget(self.output_edit, 4, 1, 1, 2)
         layout.addWidget(self.output_button, 4, 3)
 
@@ -285,6 +303,22 @@ class MainWindow(QMainWindow):
         self.tolerance_label = QLabel("选点容差")
         layout.addWidget(self.tolerance_label, 5, 2)
         layout.addWidget(self.tolerance_spin, 5, 3)
+
+        # 批量重命名专属控件（与 row 5 复用行，默认隐藏）
+        self.rename_prefix_label = QLabel("文件前缀")
+        self.rename_prefix_edit = QLineEdit("Output")
+        self.rename_start_label = QLabel("起始序号")
+        self.rename_start_spin = QSpinBox()
+        self.rename_start_spin.setRange(0, 99999)
+        self.rename_start_spin.setValue(1)
+        layout.addWidget(self.rename_prefix_label, 5, 0)
+        layout.addWidget(self.rename_prefix_edit, 5, 1)
+        layout.addWidget(self.rename_start_label, 5, 2)
+        layout.addWidget(self.rename_start_spin, 5, 3)
+        self.rename_prefix_label.hide()
+        self.rename_prefix_edit.hide()
+        self.rename_start_label.hide()
+        self.rename_start_spin.hide()
 
         option_row = QHBoxLayout()
         option_row.addWidget(self.remove_white_checkbox)
@@ -337,6 +371,11 @@ class MainWindow(QMainWindow):
             self.target_frame_count_label.setVisible(True)
             self.target_frame_count_spin.setVisible(True)
 
+    def _set_output_row_visible(self, visible):
+        fn = lambda w: w.show() if visible else w.hide()
+        for w in [self.output_label, self.output_edit, self.output_button]:
+            fn(w)
+
     def on_mode_changed(self, index):
         """功能模式切换时的回调"""
         mode = self.mode_combo.currentData()
@@ -349,6 +388,8 @@ class MainWindow(QMainWindow):
             self.input_edit.setText(self._last_batch_input_dir if hasattr(self, '_last_batch_input_dir') else os.path.join(self._base_dir(), "Input"))
             self.output_edit.setText(os.path.join(self._base_dir(), "OutPut"))
 
+            # 显示输出目录行
+            self._set_output_row_visible(True)
             # 显示批量抠图相关控件
             self.threshold_label.setVisible(True)
             self.threshold_spin.setVisible(True)
@@ -369,7 +410,11 @@ class MainWindow(QMainWindow):
             self.frame_interval_spin.setVisible(False)
             self.target_frame_count_label.setVisible(False)
             self.target_frame_count_spin.setVisible(False)
-        else:
+            # 隐藏重命名专属控件
+            for w in [self.rename_prefix_label, self.rename_prefix_edit,
+                      self.rename_start_label, self.rename_start_spin]:
+                w.setVisible(False)
+        elif mode == "video_extract":
             # 保存当前批量抠图的输入目录
             if self.input_label.text() == "输入目录":
                 self._last_batch_input_dir = self.input_edit.text()
@@ -384,6 +429,8 @@ class MainWindow(QMainWindow):
                 self.input_edit.setText(self._video_input_dir)
             self.output_edit.setText(os.path.join(self._base_dir(), "Input"))
 
+            # 显示输出目录行
+            self._set_output_row_visible(True)
             # 隐藏批量抠图相关控件
             self.threshold_label.setVisible(False)
             self.threshold_spin.setVisible(False)
@@ -397,11 +444,46 @@ class MainWindow(QMainWindow):
             self.resize_height_spin.setVisible(False)
             self.image_button.setVisible(False)
             self.clear_points_button.setVisible(False)
+            # 隐藏重命名专属控件
+            for w in [self.rename_prefix_label, self.rename_prefix_edit,
+                      self.rename_start_label, self.rename_start_spin]:
+                w.setVisible(False)
 
             # 显示视频抽帧相关控件
             self.frame_mode_combo.setVisible(True)
             # 根据当前抽帧方式显示对应控件（默认按数量抽帧）
             self.on_frame_mode_changed(self.frame_mode_combo.currentIndex())
+        elif mode == "batch_rename":
+            # 保存当前批量抠图的输入目录
+            if self.input_label.text() == "输入目录":
+                self._last_batch_input_dir = self.input_edit.text()
+
+            # 批量重命名模式
+            self.input_label.setText("目标目录")
+            self.input_button.setText("选择目录")
+            self.input_button.clicked.disconnect()
+            self.input_button.clicked.connect(self.select_input_dir)
+            self.input_edit.setText(self._rename_target_dir)
+
+            # 隐藏输出目录行（重命名为原地操作）
+            self._set_output_row_visible(False)
+            # 隐藏批量抠图相关控件
+            for w in [self.threshold_label, self.threshold_spin,
+                      self.tolerance_label, self.tolerance_spin,
+                      self.remove_white_checkbox, self.remove_points_checkbox,
+                      self.resize_checkbox, self.keep_name_checkbox,
+                      self.resize_width_spin, self.resize_height_spin,
+                      self.image_button, self.clear_points_button]:
+                w.setVisible(False)
+            # 隐藏视频抽帧相关控件
+            for w in [self.frame_mode_combo, self.frame_interval_label,
+                      self.frame_interval_spin, self.target_frame_count_label,
+                      self.target_frame_count_spin]:
+                w.setVisible(False)
+            # 显示重命名专属控件
+            for w in [self.rename_prefix_label, self.rename_prefix_edit,
+                      self.rename_start_label, self.rename_start_spin]:
+                w.setVisible(True)
 
     def _base_dir(self):
         return os.path.dirname(
@@ -580,7 +662,7 @@ class MainWindow(QMainWindow):
         input_path = self.input_edit.text().strip()
         output_dir = self.output_edit.text().strip()
 
-        if not output_dir or not os.path.isdir(output_dir):
+        if mode != "batch_rename" and (not output_dir or not os.path.isdir(output_dir)):
             if self.log_dialog is None:
                 self.log_dialog = LogDialog(self)
             self.log_dialog.append("请输入有效的输出目录")
@@ -647,7 +729,7 @@ class MainWindow(QMainWindow):
                 keep_original_name=self.keep_name_checkbox.isChecked(),
                 parent=self,
             )
-        else:  # video_extract
+        elif mode == "video_extract":
             video_files = []
             if not input_path:
                 # 使用默认 VideoInput 目录
@@ -690,6 +772,22 @@ class MainWindow(QMainWindow):
                 frame_interval=frame_interval,
                 frame_mode=frame_mode,
                 target_frame_count=target_frame_count,
+                parent=self,
+            )
+        elif mode == "batch_rename":
+            rename_dir = input_path
+            if not os.path.isdir(rename_dir):
+                self.log_dialog.append(f"目标目录不存在：{rename_dir}")
+                self.start_button.setEnabled(True)
+                self.input_button.setEnabled(True)
+                return
+            prefix = self.rename_prefix_edit.text().strip() or "Output"
+            start_num = self.rename_start_spin.value()
+            self.worker = ProcessWorker(
+                mode='batch_rename',
+                input_dir=rename_dir,
+                rename_prefix=prefix,
+                rename_start_num=start_num,
                 parent=self,
             )
 
@@ -806,9 +904,9 @@ class MainWindow(QMainWindow):
         if self.log_dialog:
             self.log_dialog.append(message)
 
-        # 视频抽帧模式下不更新预览（输出帧会很多）
+        # 视频抽帧和批量重命名模式下不更新预览
         mode = self.mode_combo.currentData()
-        if mode == "video_extract":
+        if mode in ("video_extract", "batch_rename"):
             return
 
         preview_path = input_path

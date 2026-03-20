@@ -439,6 +439,37 @@ def extract_video_frames(
     return saved_count, total_expected, frame_subdir_name
 
 
+RENAME_SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
+
+
+def batch_rename_images(directory, prefix, start_num=1, on_progress=None):
+    """
+    将 directory 内所有图片按文件名排序后，重命名为 {prefix}{n}{ext}。
+    返回 (success_count, total_count)。
+    """
+    files = sorted([
+        f for f in os.listdir(directory)
+        if os.path.splitext(f)[1].lower() in RENAME_SUPPORTED_EXTS
+    ])
+    total = len(files)
+    success = 0
+    for i, fname in enumerate(files):
+        old_path = os.path.join(directory, fname)
+        ext = os.path.splitext(fname)[1].lower()
+        new_name = f"{prefix}{start_num + i}{ext}"
+        new_path = os.path.join(directory, new_name)
+        if old_path == new_path:
+            success += 1
+            if on_progress:
+                on_progress(i + 1, total, old_path, new_path, True)
+            continue
+        os.rename(old_path, new_path)
+        success += 1
+        if on_progress:
+            on_progress(i + 1, total, old_path, new_path, True)
+    return success, total
+
+
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(
         sys.executable if getattr(sys, "frozen", False) else __file__
