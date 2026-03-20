@@ -699,21 +699,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _resolve_selected_points(self, input_dir):
-        selected_points = {}
-        for path, points in self.selected_points_map.items():
-            if not points:
-                continue
-            if path in selected_points:
-                selected_points[path] = list(points)
-                continue
-            base_name = os.path.basename(path)
-            if input_dir:
-                candidate = os.path.join(input_dir, base_name)
-                if os.path.isfile(candidate):
-                    selected_points[candidate] = list(points)
-                    continue
-            selected_points[path] = list(points)
-        return selected_points
+        return {os.path.normpath(path): list(points) for path, points in self.selected_points_map.items() if points}
 
     def _to_qimage(self, img):
         if img is None:
@@ -795,13 +781,7 @@ class MainWindow(QMainWindow):
         self.resize_height_spin.setValue(self.current_image_size[1])
         if update_key:
             self.current_input_path = image_path
-            input_dir = self.input_edit.text().strip()
-            current_key = image_path
-            if input_dir and os.path.isdir(input_dir):
-                candidate = os.path.join(input_dir, os.path.basename(image_path))
-                if os.path.isfile(candidate):
-                    current_key = candidate
-            self.current_input_key = current_key
+            self.current_input_key = os.path.normpath(image_path)
             if self.current_input_key not in self.selected_points_map:
                 self.selected_points_map[self.current_input_key] = []
         self._refresh_preview_scaled()
@@ -862,6 +842,7 @@ class MainWindow(QMainWindow):
             self.preview_label.setPixmap(QPixmap())
 
     def on_finished(self, success_count, total_count):
+        self.progress_bar.setValue(100)
         self.start_button.setEnabled(True)
         self.input_button.setEnabled(True)
         self.output_button.setEnabled(True)

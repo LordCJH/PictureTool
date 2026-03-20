@@ -257,11 +257,14 @@ def process_directory(
     os.makedirs(output_dir, exist_ok=True)
 
     image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-    input_files = sorted(
-        f for f in os.listdir(input_dir)
-        if os.path.isfile(os.path.join(input_dir, f))
-        and os.path.splitext(f)[1].lower() in image_exts
-    )
+    input_files = []
+    for root, dirs, files in os.walk(input_dir):
+        dirs.sort()
+        for f in sorted(files):
+            if os.path.splitext(f)[1].lower() in image_exts:
+                abs_path = os.path.join(root, f)
+                rel_path = os.path.relpath(abs_path, input_dir)
+                input_files.append((rel_path, abs_path))
 
     if not input_files:
         print(f"No image files found in: {input_dir}")
@@ -272,14 +275,15 @@ def process_directory(
 
     selected_points_map = selected_points_map or {}
 
-    for index, file_name in enumerate(input_files):
-        input_path = os.path.join(input_dir, file_name)
+    for index, (rel_path, input_path) in enumerate(input_files):
         if keep_original_name:
-            output_name = file_name
+            output_rel = rel_path
         else:
-            output_name = f"output{index + 1}.png"
-        output_path = os.path.join(output_dir, output_name)
-        selected_points = selected_points_map.get(input_path)
+            rel_dir = os.path.dirname(rel_path)
+            output_rel = os.path.join(rel_dir, f"output{index + 1}.png") if rel_dir else f"output{index + 1}.png"
+        output_path = os.path.join(output_dir, output_rel)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        selected_points = selected_points_map.get(os.path.normpath(input_path))
         ok = True
 
         img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
@@ -382,47 +386,53 @@ def extract_video_frames(
     os.makedirs(frame_subdir_path, exist_ok=True)
 
     saved_count = 0
-    frame_pos = 0
 
     # 获取视频文件名（不含扩展名）作为前缀
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
-    while True:
-        # 如果已达到目标帧数，停止抽帧
-        if target_frame_count and saved_count >= target_frame_count:
-            break
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-        success, frame = cap.read()
-        if not success:
-            break
-
-        # 生成输出文件名（保存在 frameN 子目录下）
-        output_name = f"{video_name}_frame_{saved_count:04d}.{output_format}"
+    def _save_frame(frame, idx):
+        output_name = f"{video_name}_frame_{idx:04d}.{output_format}"
         output_path = os.path.join(frame_subdir_path, output_name)
-
-        # 转换BGR到BGRA
         if len(frame.shape) == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
         elif frame.shape[2] == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-
-        # 保存帧
         ok = write_image_unicode(output_path, frame)
         if ok:
-            saved_count += 1
             print(f"保存帧: {output_path}")
         else:
             print(f"保存失败: {output_path}")
+        return ok, output_path
 
-        if on_progress is not None:
-            on_progress(saved_count, total_expected, video_path, output_path, ok)
-
-        frame_pos += frame_interval
-
-        # 防止无限循环（如果视频没有正确结束）
-        if frame_pos >= total_frames:
-            break
+    if target_frame_count and target_frame_count > 0:
+        # count 模式：精准 seek，只读目标帧数次，release 时无残留缓冲
+        for i in range(target_frame_count):
+            frame_pos = i * frame_interval
+            if frame_pos >= total_frames:
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+            success, frame = cap.read()
+            if not success:
+                break
+            ok, output_path = _save_frame(frame, saved_count)
+            if ok:
+                saved_count += 1
+            if on_progress is not None:
+                on_progress(saved_count, total_expected, video_path, output_path, ok)
+    else:
+        # interval 模式：顺序读帧，自然跑到 EOF，release 无阻塞
+        read_count = 0
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+            if read_count % frame_interval == 0:
+                ok, output_path = _save_frame(frame, saved_count)
+                if ok:
+                    saved_count += 1
+                if on_progress is not None:
+                    on_progress(saved_count, total_expected, video_path, output_path, ok)
+            read_count += 1
 
     cap.release()
     print(f"视频抽帧完成: 共保存 {saved_count} 帧到 {frame_subdir_path}")
