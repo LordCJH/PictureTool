@@ -240,6 +240,224 @@ def remove_white_edges(input_path, output_path, white_trigger=235, selected_poin
     return ok
 
 
+def _rasterize_strokes_mask(shape, strokes, thickness=3):
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not strokes:
+        return mask
+    for stroke in strokes:
+        if len(stroke) < 2:
+            continue
+        points = np.array(stroke, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(mask, [points], False, 255, thickness=thickness, lineType=cv2.LINE_8)
+    return mask
+
+
+def _build_component_groups(labels, num_labels, merge_strokes):
+    parent = list(range(num_labels))
+
+    def find(label):
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    def union(a, b):
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    if merge_strokes:
+        for stroke in merge_strokes:
+            if len(stroke) < 2:
+                continue
+            stroke_mask = _rasterize_strokes_mask(labels.shape[:2], [stroke], thickness=3)
+            touched_labels = np.unique(labels[stroke_mask == 255])
+            touched_labels = [int(label) for label in touched_labels if label > 0]
+            if len(touched_labels) < 2:
+                continue
+            base = touched_labels[0]
+            for label in touched_labels[1:]:
+                union(base, label)
+
+    groups = {}
+    for label in range(1, num_labels):
+        root = find(label)
+        groups.setdefault(root, []).append(label)
+    return list(groups.values())
+
+
+def slice_image_objects(
+    input_path,
+    output_dir,
+    min_component_area=100,
+    white_trigger=235,
+    selected_points=None,
+    merge_strokes=None,
+    split_strokes=None,
+    color_tolerance=5,
+    do_remove_white=True,
+    do_remove_points=False,
+    do_resize=False,
+    target_width=0,
+    target_height=0,
+):
+    min_component_area = max(100, int(min_component_area))
+    img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"Unable to load image {input_path}")
+        return False, 0, 0, output_dir
+
+    img = ensure_bgra(img)
+
+    if do_remove_white:
+        img = _remove_white_edges_from_image(
+            img,
+            white_trigger=white_trigger,
+            selected_points=selected_points,
+            color_tolerance=color_tolerance,
+        )
+
+    if do_remove_points:
+        _clear_selected_points(img, selected_points, color_tolerance)
+
+    foreground_mask = np.where(img[:, :, 3] > 0, 255, 0).astype(np.uint8)
+    split_mask = _rasterize_strokes_mask(foreground_mask.shape[:2], split_strokes, thickness=3)
+    if np.any(split_mask):
+        foreground_mask[split_mask == 255] = 0
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        foreground_mask, connectivity=8
+    )
+
+    saved_count = 0
+    ignored_count = 0
+    object_index = 0
+    all_ok = True
+    output_dir_created = False
+    valid_labels = [
+        label for label in range(1, num_labels)
+        if int(stats[label, cv2.CC_STAT_AREA]) >= min_component_area
+    ]
+    ignored_count = max(0, (num_labels - 1) - len(valid_labels))
+    valid_label_set = set(valid_labels)
+    component_groups = [
+        [label for label in group if label in valid_label_set]
+        for group in _build_component_groups(labels, num_labels, merge_strokes)
+    ]
+    component_groups = [group for group in component_groups if group]
+
+    for group_labels in component_groups:
+        x = min(int(stats[label, cv2.CC_STAT_LEFT]) for label in group_labels)
+        y = min(int(stats[label, cv2.CC_STAT_TOP]) for label in group_labels)
+        right = max(int(stats[label, cv2.CC_STAT_LEFT] + stats[label, cv2.CC_STAT_WIDTH]) for label in group_labels)
+        bottom = max(int(stats[label, cv2.CC_STAT_TOP] + stats[label, cv2.CC_STAT_HEIGHT]) for label in group_labels)
+        w = right - x
+        h = bottom - y
+        component_mask = np.isin(labels[y:y + h, x:x + w], group_labels)
+        object_img = img[y:y + h, x:x + w].copy()
+        object_img[~component_mask] = [0, 0, 0, 0]
+
+        if do_resize:
+            object_img = resize_to_fit(object_img, target_width, target_height)
+
+        object_index += 1
+        if not output_dir_created:
+            os.makedirs(output_dir, exist_ok=True)
+            output_dir_created = True
+        output_path = os.path.join(output_dir, f"object_{object_index:03d}.png")
+        ok = write_image_unicode(output_path, object_img)
+        if ok:
+            saved_count += 1
+            print(f"Saved object to: {output_path}")
+        else:
+            all_ok = False
+            print(f"Failed to save object image: {output_path}")
+
+    return all_ok, saved_count, ignored_count, output_dir
+
+
+def slice_directory_objects(
+    input_dir,
+    output_dir,
+    min_component_area=100,
+    white_trigger=235,
+    selected_points_map=None,
+    merge_strokes_map=None,
+    split_strokes_map=None,
+    color_tolerance=5,
+    do_remove_white=True,
+    do_remove_points=False,
+    do_resize=False,
+    target_width=0,
+    target_height=0,
+    on_progress=None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    input_files = []
+    for root, dirs, files in os.walk(input_dir):
+        dirs.sort()
+        for f in sorted(files):
+            if os.path.splitext(f)[1].lower() in image_exts:
+                abs_path = os.path.join(root, f)
+                rel_path = os.path.relpath(abs_path, input_dir)
+                input_files.append((rel_path, abs_path))
+
+    if not input_files:
+        print(f"No image files found in: {input_dir}")
+        return 0, 0, 0
+
+    success_count = 0
+    total_count = len(input_files)
+    total_object_count = 0
+    selected_points_map = selected_points_map or {}
+    merge_strokes_map = merge_strokes_map or {}
+    split_strokes_map = split_strokes_map or {}
+
+    for index, (rel_path, input_path) in enumerate(input_files):
+        rel_dir = os.path.dirname(rel_path)
+        base_name = os.path.splitext(os.path.basename(rel_path))[0]
+        output_rel = os.path.join(rel_dir, base_name) if rel_dir else base_name
+        image_output_dir = os.path.join(output_dir, output_rel)
+        normalized_input_path = os.path.normpath(input_path)
+        selected_points = selected_points_map.get(normalized_input_path)
+        merge_strokes = merge_strokes_map.get(normalized_input_path)
+        split_strokes = split_strokes_map.get(normalized_input_path)
+        ok, saved_count, ignored_count, result_path = slice_image_objects(
+            input_path,
+            image_output_dir,
+            min_component_area=min_component_area,
+            white_trigger=white_trigger,
+            selected_points=selected_points,
+            merge_strokes=merge_strokes,
+            split_strokes=split_strokes,
+            color_tolerance=color_tolerance,
+            do_remove_white=do_remove_white,
+            do_remove_points=do_remove_points,
+            do_resize=do_resize,
+            target_width=target_width,
+            target_height=target_height,
+        )
+        total_object_count += saved_count
+
+        if ok:
+            success_count += 1
+        print(
+            f"Extracted {saved_count} objects from {input_path}"
+            f" (ignored {ignored_count} small components)."
+        )
+        if on_progress is not None:
+            on_progress(index + 1, total_count, input_path, result_path, ok)
+
+    print(
+        f"Processed {success_count}/{total_count} images, "
+        f"saved {total_object_count} objects."
+    )
+    return success_count, total_count, total_object_count
+
+
 def process_directory(
     input_dir,
     output_dir,

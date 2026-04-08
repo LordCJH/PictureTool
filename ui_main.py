@@ -23,15 +23,41 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QCheckBox,
 )
-from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette
+from PySide6.QtGui import QImage, QPixmap, QPainter, QBrush, QColor, QPalette, QPen
 
-from Zidongkoutu import ensure_bgra, process_directory, read_image_unicode, extract_video_frames, batch_rename_images
+from Zidongkoutu import (
+    ensure_bgra,
+    process_directory,
+    read_image_unicode,
+    extract_video_frames,
+    batch_rename_images,
+    slice_directory_objects,
+)
+
+
 class ClickableLabel(QLabel):
     clicked = Signal(QPoint, Qt.MouseButton)
+    pressed = Signal(QPoint, Qt.MouseButton)
+    moved = Signal(QPoint, Qt.MouseButton)
+    released = Signal(QPoint, Qt.MouseButton)
 
     def mousePressEvent(self, event):
-        self.clicked.emit(event.position().toPoint(), event.button())
+        position = event.position().toPoint()
+        self.clicked.emit(position, event.button())
+        self.pressed.emit(position, event.button())
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        buttons = event.buttons()
+        primary_button = Qt.LeftButton if buttons & Qt.LeftButton else Qt.NoButton
+        self.moved.emit(event.position().toPoint(), primary_button)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.released.emit(event.position().toPoint(), event.button())
+        super().mouseReleaseEvent(event)
+
+
 class LogDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,12 +83,17 @@ class ProcessWorker(QThread):
                  do_remove_points=True, do_resize=False, target_width=0, target_height=0,
                  keep_original_name=False, video_paths=None, frame_interval=1,
                  frame_mode="interval", target_frame_count=None,
-                 rename_prefix='Output', rename_start_num=1, parent=None):
+                 rename_prefix='Output', rename_start_num=1,
+                 min_component_area=100, merge_strokes_map=None,
+                 split_strokes_map=None, parent=None):
         super().__init__(parent)
         self.mode = mode  # "batch_process"、"video_extract" 或 "batch_rename"
         # 批量重命名参数
         self.rename_prefix = rename_prefix
         self.rename_start_num = rename_start_num
+        self.min_component_area = min_component_area
+        self.merge_strokes_map = merge_strokes_map or {}
+        self.split_strokes_map = split_strokes_map or {}
         # 批量抠图参数
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -103,6 +134,26 @@ class ProcessWorker(QThread):
                     on_progress=_on_progress,
                 )
                 self.log.emit("批量抠图结束")
+                self.finished.emit(success_count, total_count)
+            elif self.mode == "object_slice":
+                self.log.emit("开始一键切图...")
+                success_count, total_count, object_count = slice_directory_objects(
+                    self.input_dir,
+                    self.output_dir,
+                    min_component_area=self.min_component_area,
+                    white_trigger=self.white_trigger,
+                    selected_points_map=self.selected_points_map,
+                    merge_strokes_map=self.merge_strokes_map,
+                    split_strokes_map=self.split_strokes_map,
+                    color_tolerance=self.color_tolerance,
+                    do_remove_white=self.do_remove_white,
+                    do_remove_points=self.do_remove_points,
+                    do_resize=self.do_resize,
+                    target_width=self.target_width,
+                    target_height=self.target_height,
+                    on_progress=_on_progress,
+                )
+                self.log.emit(f"一键切图结束，共导出 {object_count} 个物件")
                 self.finished.emit(success_count, total_count)
             elif self.mode == "video_extract":
                 self.log.emit("开始视频抽帧...")
@@ -160,6 +211,11 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.log_dialog = None
         self.selected_points_map = {}
+        self.merge_strokes_map = {}
+        self.split_strokes_map = {}
+        self.current_drag_stroke = None
+        self.is_drawing_stroke = False
+        self.stroke_mode_enabled = False
         self.current_input_path = None
         self.current_input_key = None
         self.current_image_size = None
@@ -173,6 +229,7 @@ class MainWindow(QMainWindow):
         # 功能选择
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("批量抠图", "batch_process")
+        self.mode_combo.addItem("一键切图", "object_slice")
         self.mode_combo.addItem("视频抽帧", "video_extract")
         self.mode_combo.addItem("批量重命名", "batch_rename")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
@@ -216,6 +273,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
 
         self.clear_points_button = QPushButton("清除选点")
+        self.toggle_stroke_mode_button = QPushButton("开启划线模式")
+        self.toggle_stroke_mode_button.setCheckable(True)
 
         self.remove_white_checkbox = QCheckBox("去除白边")
         self.remove_white_checkbox.setChecked(True)
@@ -288,6 +347,7 @@ class MainWindow(QMainWindow):
 
         point_row = QHBoxLayout()
         point_row.addWidget(self.image_button)
+        point_row.addWidget(self.toggle_stroke_mode_button)
         point_row.addWidget(self.clear_points_button)
         layout.addLayout(point_row, 3, 3)
 
@@ -303,6 +363,21 @@ class MainWindow(QMainWindow):
         self.tolerance_label = QLabel("选点容差")
         layout.addWidget(self.tolerance_label, 5, 2)
         layout.addWidget(self.tolerance_spin, 5, 3)
+
+        self.component_area_label = QLabel("最小连通像素")
+        self.component_area_spin = QSpinBox()
+        self.component_area_spin.setRange(100, 99999999)
+        self.component_area_spin.setValue(100)
+        self.component_area_label.hide()
+        self.component_area_spin.hide()
+
+        self.stroke_mode_label = QLabel("划线操作")
+        self.stroke_mode_combo = QComboBox()
+        self.stroke_mode_combo.addItem("连接物件", "merge")
+        self.stroke_mode_combo.addItem("切开物件", "split")
+        self.stroke_mode_combo.currentIndexChanged.connect(self.on_stroke_mode_changed)
+        self.stroke_mode_label.hide()
+        self.stroke_mode_combo.hide()
 
         # 批量重命名专属控件（与 row 5 复用行，默认隐藏）
         self.rename_prefix_label = QLabel("文件前缀")
@@ -325,12 +400,18 @@ class MainWindow(QMainWindow):
         option_row.addWidget(self.remove_points_checkbox)
         option_row.addWidget(self.resize_checkbox)
         option_row.addWidget(self.keep_name_checkbox)
+        option_row.addWidget(self.component_area_label)
+        option_row.addWidget(self.component_area_spin)
+        option_row.addWidget(self.stroke_mode_label)
+        option_row.addWidget(self.stroke_mode_combo)
         layout.addLayout(option_row, 6, 0, 1, 4)
 
         resize_row = QHBoxLayout()
-        resize_row.addWidget(QLabel("宽"))
+        self.resize_width_label = QLabel("宽")
+        self.resize_height_label = QLabel("高")
+        resize_row.addWidget(self.resize_width_label)
         resize_row.addWidget(self.resize_width_spin)
-        resize_row.addWidget(QLabel("高"))
+        resize_row.addWidget(self.resize_height_label)
         resize_row.addWidget(self.resize_height_spin)
         resize_row.addStretch(1)
         layout.addLayout(resize_row, 7, 0, 1, 4)
@@ -344,9 +425,12 @@ class MainWindow(QMainWindow):
         self.input_button.clicked.connect(self.select_input_dir)
         self.output_button.clicked.connect(self.select_output_dir)
         self.image_button.clicked.connect(self.select_preview_image)
+        self.toggle_stroke_mode_button.clicked.connect(self.toggle_stroke_mode)
         self.start_button.clicked.connect(self.start_processing)
         self.clear_points_button.clicked.connect(self.clear_selected_points)
-        self.preview_label.clicked.connect(self.on_preview_clicked)
+        self.preview_label.pressed.connect(self.on_preview_pressed)
+        self.preview_label.moved.connect(self.on_preview_moved)
+        self.preview_label.released.connect(self.on_preview_released)
 
         # 程序启动时自动加载默认输入目录的第一张图片
         default_input_dir = self.input_edit.text().strip()
@@ -354,6 +438,23 @@ class MainWindow(QMainWindow):
             first_image = self._get_first_image_in_directory(default_input_dir)
             if first_image:
                 self._show_preview(first_image)
+
+    def toggle_stroke_mode(self, checked):
+        self.stroke_mode_enabled = checked
+        if not checked:
+            self.current_drag_stroke = None
+            self.is_drawing_stroke = False
+        self._sync_stroke_mode_ui()
+
+    def on_stroke_mode_changed(self, index):
+        self._sync_stroke_mode_ui()
+
+    def _sync_stroke_mode_ui(self):
+        enabled = self.mode_combo.currentData() == "object_slice" and self.stroke_mode_enabled
+        self.toggle_stroke_mode_button.setChecked(enabled)
+        self.toggle_stroke_mode_button.setText("关闭划线模式" if enabled else "开启划线模式")
+        self.preview_label.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        self._refresh_preview_scaled()
 
     def on_frame_mode_changed(self, index):
         """抽帧方式切换时的回调"""
@@ -387,6 +488,10 @@ class MainWindow(QMainWindow):
             self.input_button.clicked.connect(self.select_input_dir)
             self.input_edit.setText(self._last_batch_input_dir if hasattr(self, '_last_batch_input_dir') else os.path.join(self._base_dir(), "Input"))
             self.output_edit.setText(os.path.join(self._base_dir(), "OutPut"))
+            self.clear_points_button.setText("清除选点")
+            self.toggle_stroke_mode_button.setChecked(False)
+            self.stroke_mode_enabled = False
+            self._sync_stroke_mode_ui()
 
             # 显示输出目录行
             self._set_output_row_visible(True)
@@ -395,13 +500,22 @@ class MainWindow(QMainWindow):
             self.threshold_spin.setVisible(True)
             self.tolerance_label.setVisible(True)
             self.tolerance_spin.setVisible(True)
+            self.component_area_label.setVisible(False)
+            self.component_area_spin.setVisible(False)
+            self.stroke_mode_label.setVisible(False)
+            self.stroke_mode_combo.setVisible(False)
             self.remove_white_checkbox.setVisible(True)
             self.remove_points_checkbox.setVisible(True)
             self.resize_checkbox.setVisible(True)
             self.keep_name_checkbox.setVisible(True)
             # 根据复选框状态显示/隐藏分辨率设置
             self.on_resize_toggled(self.resize_checkbox.isChecked())
+            self.resize_width_label.setVisible(True)
+            self.resize_width_spin.setVisible(True)
+            self.resize_height_label.setVisible(True)
+            self.resize_height_spin.setVisible(True)
             self.image_button.setVisible(True)
+            self.toggle_stroke_mode_button.setVisible(False)
             self.clear_points_button.setVisible(True)
 
             # 隐藏视频抽帧相关控件
@@ -411,6 +525,50 @@ class MainWindow(QMainWindow):
             self.target_frame_count_label.setVisible(False)
             self.target_frame_count_spin.setVisible(False)
             # 隐藏重命名专属控件
+            for w in [self.rename_prefix_label, self.rename_prefix_edit,
+                      self.rename_start_label, self.rename_start_spin]:
+                w.setVisible(False)
+        elif mode == "object_slice":
+            if self.input_label.text() == "输入目录":
+                self._last_batch_input_dir = self.input_edit.text()
+
+            self.input_label.setText("输入目录")
+            self.input_button.setText("选择输入目录")
+            self.input_button.clicked.disconnect()
+            self.input_button.clicked.connect(self.select_input_dir)
+            self.input_edit.setText(self._last_batch_input_dir if hasattr(self, '_last_batch_input_dir') else os.path.join(self._base_dir(), "Input"))
+            self.output_edit.setText(os.path.join(self._base_dir(), "OutPut"))
+            self.clear_points_button.setText("清除当前线")
+            self.toggle_stroke_mode_button.setChecked(False)
+            self.stroke_mode_enabled = False
+            self._sync_stroke_mode_ui()
+
+            self._set_output_row_visible(True)
+            self.threshold_label.setVisible(False)
+            self.threshold_spin.setVisible(False)
+            self.tolerance_label.setVisible(False)
+            self.tolerance_spin.setVisible(False)
+            self.component_area_label.setVisible(True)
+            self.component_area_spin.setVisible(True)
+            self.stroke_mode_label.setVisible(True)
+            self.stroke_mode_combo.setVisible(True)
+            self.remove_white_checkbox.setVisible(False)
+            self.remove_points_checkbox.setVisible(False)
+            self.resize_checkbox.setVisible(False)
+            self.keep_name_checkbox.setVisible(False)
+            self.resize_width_label.setVisible(False)
+            self.resize_width_spin.setVisible(False)
+            self.resize_height_label.setVisible(False)
+            self.resize_height_spin.setVisible(False)
+            self.image_button.setVisible(True)
+            self.toggle_stroke_mode_button.setVisible(True)
+            self.clear_points_button.setVisible(True)
+
+            self.frame_mode_combo.setVisible(False)
+            self.frame_interval_label.setVisible(False)
+            self.frame_interval_spin.setVisible(False)
+            self.target_frame_count_label.setVisible(False)
+            self.target_frame_count_spin.setVisible(False)
             for w in [self.rename_prefix_label, self.rename_prefix_edit,
                       self.rename_start_label, self.rename_start_spin]:
                 w.setVisible(False)
@@ -436,13 +594,20 @@ class MainWindow(QMainWindow):
             self.threshold_spin.setVisible(False)
             self.tolerance_label.setVisible(False)
             self.tolerance_spin.setVisible(False)
+            self.component_area_label.setVisible(False)
+            self.component_area_spin.setVisible(False)
+            self.stroke_mode_label.setVisible(False)
+            self.stroke_mode_combo.setVisible(False)
             self.remove_white_checkbox.setVisible(False)
             self.remove_points_checkbox.setVisible(False)
             self.resize_checkbox.setVisible(False)
             self.keep_name_checkbox.setVisible(False)
+            self.resize_width_label.setVisible(False)
             self.resize_width_spin.setVisible(False)
+            self.resize_height_label.setVisible(False)
             self.resize_height_spin.setVisible(False)
             self.image_button.setVisible(False)
+            self.toggle_stroke_mode_button.setVisible(False)
             self.clear_points_button.setVisible(False)
             # 隐藏重命名专属控件
             for w in [self.rename_prefix_label, self.rename_prefix_edit,
@@ -470,10 +635,13 @@ class MainWindow(QMainWindow):
             # 隐藏批量抠图相关控件
             for w in [self.threshold_label, self.threshold_spin,
                       self.tolerance_label, self.tolerance_spin,
+                      self.component_area_label, self.component_area_spin,
+                      self.stroke_mode_label, self.stroke_mode_combo,
                       self.remove_white_checkbox, self.remove_points_checkbox,
                       self.resize_checkbox, self.keep_name_checkbox,
-                      self.resize_width_spin, self.resize_height_spin,
-                      self.image_button, self.clear_points_button]:
+                      self.resize_width_label, self.resize_width_spin,
+                      self.resize_height_label, self.resize_height_spin,
+                      self.image_button, self.toggle_stroke_mode_button, self.clear_points_button]:
                 w.setVisible(False)
             # 隐藏视频抽帧相关控件
             for w in [self.frame_mode_combo, self.frame_interval_label,
@@ -505,6 +673,19 @@ class MainWindow(QMainWindow):
     def clear_selected_points(self):
         if not self.current_input_key:
             return
+        mode = self.mode_combo.currentData()
+        if mode == "object_slice":
+            current_mode = self.stroke_mode_combo.currentData()
+            if current_mode == "split":
+                strokes = self.split_strokes_map.get(self.current_input_key)
+            else:
+                strokes = self.merge_strokes_map.get(self.current_input_key)
+            if strokes:
+                strokes.clear()
+            self.current_drag_stroke = None
+            self.is_drawing_stroke = False
+            self._refresh_preview_scaled()
+            return
         points = self.selected_points_map.get(self.current_input_key)
         if not points:
             return
@@ -515,6 +696,44 @@ class MainWindow(QMainWindow):
         if not self.current_input_key:
             return []
         return self.selected_points_map.setdefault(self.current_input_key, [])
+
+    def _current_merge_strokes(self):
+        if not self.current_input_key:
+            return []
+        return self.merge_strokes_map.setdefault(self.current_input_key, [])
+
+    def _current_split_strokes(self):
+        if not self.current_input_key:
+            return []
+        return self.split_strokes_map.setdefault(self.current_input_key, [])
+
+    def _preview_position_to_image_point(self, position):
+        if not self.preview_display_rect or not self.current_image_size:
+            return None
+        if not self.preview_display_rect.contains(position):
+            return None
+
+        img_w, img_h = self.current_image_size
+        rect = self.preview_display_rect
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+
+        x = (position.x() - rect.x()) * img_w / rect.width()
+        y = (position.y() - rect.y()) * img_h / rect.height()
+        img_x = int(round(x))
+        img_y = int(round(y))
+
+        if img_x < 0 or img_y < 0 or img_x >= img_w or img_y >= img_h:
+            return None
+        return img_x, img_y
+
+    def _append_point_to_current_stroke(self, point):
+        if not self.current_drag_stroke:
+            self.current_drag_stroke = [point]
+            return
+        last_x, last_y = self.current_drag_stroke[-1]
+        if (last_x - point[0]) ** 2 + (last_y - point[1]) ** 2 >= 4:
+            self.current_drag_stroke.append(point)
 
     def _remove_nearest_point(self, points, x, y, radius=8):
         if not points:
@@ -533,29 +752,65 @@ class MainWindow(QMainWindow):
             points.pop(nearest_index)
 
     def on_preview_clicked(self, position, button):
-        if not self.preview_display_rect or not self.current_image_size:
+        if self.mode_combo.currentData() == "object_slice":
             return
-        if not self.preview_display_rect.contains(position):
-            return
-
-        img_w, img_h = self.current_image_size
-        rect = self.preview_display_rect
-        if rect.width() <= 0 or rect.height() <= 0:
+        point = self._preview_position_to_image_point(position)
+        if point is None:
             return
 
-        x = (position.x() - rect.x()) * img_w / rect.width()
-        y = (position.y() - rect.y()) * img_h / rect.height()
-        img_x = int(round(x))
-        img_y = int(round(y))
-
-        if img_x < 0 or img_y < 0 or img_x >= img_w or img_y >= img_h:
-            return
-
+        img_x, img_y = point
         points = self._current_selected_points()
         if button == Qt.RightButton:
             self._remove_nearest_point(points, img_x, img_y, radius=8)
         else:
             points.append((img_x, img_y))
+        self._refresh_preview_scaled()
+
+    def on_preview_pressed(self, position, button):
+        mode = self.mode_combo.currentData()
+        if mode != "object_slice" or button != Qt.LeftButton:
+            self.on_preview_clicked(position, button)
+            return
+        if not self.stroke_mode_enabled:
+            return
+        point = self._preview_position_to_image_point(position)
+        if point is None:
+            return
+        self.is_drawing_stroke = True
+        self.current_drag_stroke = [point]
+        self._refresh_preview_scaled()
+
+    def on_preview_moved(self, position, button):
+        if self.mode_combo.currentData() != "object_slice":
+            return
+        if not self.stroke_mode_enabled:
+            return
+        if not self.is_drawing_stroke or button != Qt.LeftButton:
+            return
+        point = self._preview_position_to_image_point(position)
+        if point is None:
+            return
+        self._append_point_to_current_stroke(point)
+        self._refresh_preview_scaled()
+
+    def on_preview_released(self, position, button):
+        if self.mode_combo.currentData() != "object_slice" or button != Qt.LeftButton:
+            return
+        if not self.stroke_mode_enabled:
+            return
+        if not self.is_drawing_stroke:
+            return
+        point = self._preview_position_to_image_point(position)
+        if point is not None:
+            self._append_point_to_current_stroke(point)
+        stroke = self.current_drag_stroke or []
+        if len(stroke) >= 2:
+            if self.stroke_mode_combo.currentData() == "split":
+                self._current_split_strokes().append(stroke.copy())
+            else:
+                self._current_merge_strokes().append(stroke.copy())
+        self.current_drag_stroke = None
+        self.is_drawing_stroke = False
         self._refresh_preview_scaled()
 
     def _get_video_files_in_directory(self, dir_path):
@@ -669,7 +924,8 @@ class MainWindow(QMainWindow):
             self.log_dialog.show()
             return
 
-        self.progress_bar.setValue(0)
+        self.current_drag_stroke = None
+        self.is_drawing_stroke = False
         self.preview_original_pixmap = None
         self.current_image_size = None
         self.current_input_path = None
@@ -727,6 +983,38 @@ class MainWindow(QMainWindow):
                 target_width=self.resize_width_spin.value(),
                 target_height=self.resize_height_spin.value(),
                 keep_original_name=self.keep_name_checkbox.isChecked(),
+                parent=self,
+            )
+        elif mode == "object_slice":
+            input_dir = input_path
+            if not input_dir or not os.path.isdir(input_dir):
+                self.log_dialog.append("请输入有效的输入目录")
+                self.start_button.setEnabled(True)
+                self.input_button.setEnabled(True)
+                self.output_button.setEnabled(True)
+                if self.image_button.isVisible():
+                    self.image_button.setEnabled(True)
+                if self.clear_points_button.isVisible():
+                    self.clear_points_button.setEnabled(True)
+                return
+
+            merge_strokes_snapshot = self._resolve_merge_strokes(input_dir)
+            split_strokes_snapshot = self._resolve_split_strokes(input_dir)
+            self.worker = ProcessWorker(
+                mode="object_slice",
+                input_dir=input_dir,
+                output_dir=output_dir,
+                white_trigger=235,
+                selected_points_map=None,
+                color_tolerance=5,
+                do_remove_white=True,
+                do_remove_points=False,
+                do_resize=False,
+                target_width=0,
+                target_height=0,
+                min_component_area=self.component_area_spin.value(),
+                merge_strokes_map=merge_strokes_snapshot,
+                split_strokes_map=split_strokes_snapshot,
                 parent=self,
             )
         elif mode == "video_extract":
@@ -799,6 +1087,40 @@ class MainWindow(QMainWindow):
     def _resolve_selected_points(self, input_dir):
         return {os.path.normpath(path): list(points) for path, points in self.selected_points_map.items() if points}
 
+    def _resolve_merge_strokes(self, input_dir):
+        if not input_dir or not os.path.isdir(input_dir):
+            return {}
+        resolved = {}
+        input_root = os.path.normpath(input_dir)
+        for path, strokes in self.merge_strokes_map.items():
+            normalized_path = os.path.normpath(path)
+            if not strokes:
+                continue
+            try:
+                if os.path.commonpath([normalized_path, input_root]) != input_root:
+                    continue
+            except ValueError:
+                continue
+            resolved[normalized_path] = [list(stroke) for stroke in strokes if len(stroke) >= 2]
+        return resolved
+
+    def _resolve_split_strokes(self, input_dir):
+        if not input_dir or not os.path.isdir(input_dir):
+            return {}
+        resolved = {}
+        input_root = os.path.normpath(input_dir)
+        for path, strokes in self.split_strokes_map.items():
+            normalized_path = os.path.normpath(path)
+            if not strokes:
+                continue
+            try:
+                if os.path.commonpath([normalized_path, input_root]) != input_root:
+                    continue
+            except ValueError:
+                continue
+            resolved[normalized_path] = [list(stroke) for stroke in strokes if len(stroke) >= 2]
+        return resolved
+
     def _to_qimage(self, img):
         if img is None:
             return None
@@ -828,15 +1150,45 @@ class MainWindow(QMainWindow):
             return
 
         base_pixmap = QPixmap(self.preview_original_pixmap)
-        points = self._current_selected_points()
-        if points:
-            painter = QPainter(base_pixmap)
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setBrush(QBrush(QColor(220, 50, 50)))
-            painter.setPen(QColor(220, 50, 50))
-            for x, y in points:
-                painter.drawEllipse(QPoint(x, y), 4, 4)
-            painter.end()
+        painter = QPainter(base_pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if self.mode_combo.currentData() == "object_slice":
+            merge_pen = QPen(QColor(40, 160, 255), 3)
+            merge_pen.setCapStyle(Qt.RoundCap)
+            merge_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(merge_pen)
+            for stroke in self._current_merge_strokes():
+                for start, end in zip(stroke, stroke[1:]):
+                    painter.drawLine(QPoint(*start), QPoint(*end))
+
+            split_pen = QPen(QColor(220, 60, 60), 3)
+            split_pen.setCapStyle(Qt.RoundCap)
+            split_pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(split_pen)
+            for stroke in self._current_split_strokes():
+                for start, end in zip(stroke, stroke[1:]):
+                    painter.drawLine(QPoint(*start), QPoint(*end))
+
+            if self.current_drag_stroke:
+                if self.stroke_mode_combo.currentData() == "split":
+                    temp_pen = QPen(QColor(255, 150, 120), 3)
+                else:
+                    temp_pen = QPen(QColor(255, 180, 40), 3)
+                temp_pen.setCapStyle(Qt.RoundCap)
+                temp_pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(temp_pen)
+                for start, end in zip(self.current_drag_stroke, self.current_drag_stroke[1:]):
+                    painter.drawLine(QPoint(*start), QPoint(*end))
+        else:
+            points = self._current_selected_points()
+            if points:
+                painter.setBrush(QBrush(QColor(220, 50, 50)))
+                painter.setPen(QColor(220, 50, 50))
+                for x, y in points:
+                    painter.drawEllipse(QPoint(x, y), 4, 4)
+
+        painter.end()
 
         scaled = base_pixmap.scaled(target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         scaled_w = scaled.width()
@@ -845,8 +1197,56 @@ class MainWindow(QMainWindow):
         y_offset = max(0, (target_size.height() - scaled_h) // 2)
         self.preview_display_rect = QRect(x_offset, y_offset, scaled_w, scaled_h)
 
-        self.preview_label.setPixmap(scaled)
+        display_pixmap = QPixmap(scaled)
+        if self.mode_combo.currentData() == "object_slice":
+            action_text = "连接物件" if self.stroke_mode_combo.currentData() == "merge" else "切开物件"
+            if self.stroke_mode_enabled:
+                overlay_text = f"划线模式：已开启（{action_text}）"
+                self.preview_label.setToolTip(f"划线模式已开启：{action_text}")
+                self.preview_label.setStatusTip(f"划线模式已开启：{action_text}")
+            else:
+                overlay_text = f"划线模式：未开启（当前：{action_text}）"
+                self.preview_label.setToolTip("")
+                self.preview_label.setStatusTip("")
+
+            overlay_painter = QPainter(display_pixmap)
+            overlay_painter.setRenderHint(QPainter.Antialiasing, True)
+            metrics = overlay_painter.fontMetrics()
+            text_width = min(max(180, metrics.horizontalAdvance(overlay_text) + 20), max(40, display_pixmap.width() - 20))
+            text_rect = QRect(10, 10, text_width, 28)
+            overlay_painter.fillRect(text_rect, QColor(0, 0, 0, 160))
+            overlay_painter.setPen(QColor(255, 255, 255))
+            overlay_painter.drawText(text_rect.adjusted(8, 0, -8, 0), Qt.AlignLeft | Qt.AlignVCenter, overlay_text)
+            overlay_painter.end()
+        else:
+            self.preview_label.setToolTip("")
+            self.preview_label.setStatusTip("")
+
+        self.preview_label.setPixmap(display_pixmap)
         self.preview_label.setText("")
+
+    def _get_latest_image_in_directory(self, dir_path):
+        if not dir_path or not os.path.isdir(dir_path):
+            return None
+        image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp')
+        latest_path = None
+        latest_mtime = None
+        try:
+            for root, dirs, files in os.walk(dir_path):
+                dirs.sort()
+                for name in files:
+                    if not name.lower().endswith(image_extensions):
+                        continue
+                    full_path = os.path.join(root, name)
+                    if not os.path.isfile(full_path):
+                        continue
+                    mtime = os.path.getmtime(full_path)
+                    if latest_path is None or mtime > latest_mtime:
+                        latest_path = full_path
+                        latest_mtime = mtime
+        except Exception:
+            return None
+        return latest_path
 
     def _show_preview(self, image_path, update_key=True):
         img = read_image_unicode(image_path, cv2.IMREAD_UNCHANGED)
@@ -882,6 +1282,12 @@ class MainWindow(QMainWindow):
             self.current_input_key = os.path.normpath(image_path)
             if self.current_input_key not in self.selected_points_map:
                 self.selected_points_map[self.current_input_key] = []
+            if self.current_input_key not in self.merge_strokes_map:
+                self.merge_strokes_map[self.current_input_key] = []
+            if self.current_input_key not in self.split_strokes_map:
+                self.split_strokes_map[self.current_input_key] = []
+            self.current_drag_stroke = None
+            self.is_drawing_stroke = False
         self._refresh_preview_scaled()
 
     def resizeEvent(self, event):
@@ -900,13 +1306,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(percent)
 
         status = "成功" if ok else "失败"
-        message = f"{current}/{total} {status}: {os.path.basename(input_path)} -> {os.path.basename(output_path)}"
+        target_name = os.path.basename(output_path.rstrip("\\/")) if output_path else ""
+        message = f"{current}/{total} {status}: {os.path.basename(input_path)} -> {target_name}"
         if self.log_dialog:
             self.log_dialog.append(message)
 
         # 视频抽帧和批量重命名模式下不更新预览
         mode = self.mode_combo.currentData()
         if mode in ("video_extract", "batch_rename"):
+            return
+        if mode == "object_slice":
+            if os.path.isfile(input_path):
+                self._show_preview(input_path, update_key=True)
             return
 
         preview_path = input_path
@@ -915,16 +1326,12 @@ class MainWindow(QMainWindow):
             output_candidate = None
             if output_path and os.path.isfile(output_path):
                 output_candidate = output_path
+            elif mode == "object_slice" and output_path and os.path.isdir(output_path):
+                output_candidate = self._get_latest_image_in_directory(output_path)
             else:
                 output_dir = self.output_edit.text().strip()
                 if output_dir and os.path.isdir(output_dir):
-                    files = [
-                        os.path.join(output_dir, name)
-                        for name in os.listdir(output_dir)
-                    ]
-                    files = [path for path in files if os.path.isfile(path)]
-                    if files:
-                        output_candidate = max(files, key=os.path.getmtime)
+                    output_candidate = self._get_latest_image_in_directory(output_dir)
             if output_candidate:
                 preview_path = output_candidate
                 update_key = False
