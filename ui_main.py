@@ -81,7 +81,8 @@ class ProcessWorker(QThread):
     def __init__(self, mode, input_dir=None, output_dir=None, white_trigger=235,
                  selected_points_map=None, color_tolerance=5, do_remove_white=True,
                  do_remove_points=True, do_resize=False, target_width=0, target_height=0,
-                 keep_original_name=False, video_paths=None, frame_interval=1,
+                 keep_original_name=False, white_roi_map=None, roi_remove_white=False,
+                 min_white_block_side=2, video_paths=None, frame_interval=1,
                  frame_mode="interval", target_frame_count=None,
                  rename_prefix='Output', rename_start_num=1,
                  min_component_area=100, merge_strokes_map=None,
@@ -106,6 +107,9 @@ class ProcessWorker(QThread):
         self.target_width = target_width
         self.target_height = target_height
         self.keep_original_name = keep_original_name
+        self.white_roi_map = white_roi_map or {}
+        self.roi_remove_white = roi_remove_white
+        self.min_white_block_side = min_white_block_side
         # 视频抽帧参数（支持多个视频）
         self.video_paths = video_paths or []  # 视频文件路径列表
         self.frame_interval = frame_interval
@@ -131,6 +135,9 @@ class ProcessWorker(QThread):
                     target_width=self.target_width,
                     target_height=self.target_height,
                     keep_original_name=self.keep_original_name,
+                    white_roi_map=self.white_roi_map,
+                    roi_remove_white=self.roi_remove_white,
+                    min_white_block_side=self.min_white_block_side,
                     on_progress=_on_progress,
                 )
                 self.log.emit("批量抠图结束")
@@ -213,9 +220,14 @@ class MainWindow(QMainWindow):
         self.selected_points_map = {}
         self.merge_strokes_map = {}
         self.split_strokes_map = {}
+        self.white_roi_map = {}
         self.current_drag_stroke = None
         self.is_drawing_stroke = False
         self.stroke_mode_enabled = False
+        self.roi_mode_enabled = False
+        self.roi_erase_enabled = False
+        self.roi_drag_start = None
+        self.current_drag_roi = None
         self.current_input_path = None
         self.current_input_key = None
         self.current_image_size = None
@@ -284,6 +296,16 @@ class MainWindow(QMainWindow):
         self.resize_checkbox.setChecked(False)
         self.keep_name_checkbox = QCheckBox("保持原文件名")
         self.keep_name_checkbox.setChecked(False)
+        self.roi_remove_white_checkbox = QCheckBox("区域去白")
+        self.roi_remove_white_checkbox.setChecked(False)
+        self.white_block_side_label = QLabel("最小白块边长")
+        self.white_block_side_spin = QSpinBox()
+        self.white_block_side_spin.setRange(1, 128)
+        self.white_block_side_spin.setValue(2)
+        self.toggle_roi_mode_button = QPushButton("开启框选模式")
+        self.toggle_roi_mode_button.setCheckable(True)
+        self.toggle_roi_erase_button = QPushButton("关闭选区擦除")
+        self.toggle_roi_erase_button.setCheckable(True)
 
         self.resize_width_spin = QSpinBox()
         self.resize_width_spin.setRange(1, 100000)
@@ -348,6 +370,8 @@ class MainWindow(QMainWindow):
         point_row = QHBoxLayout()
         point_row.addWidget(self.image_button)
         point_row.addWidget(self.toggle_stroke_mode_button)
+        point_row.addWidget(self.toggle_roi_mode_button)
+        point_row.addWidget(self.toggle_roi_erase_button)
         point_row.addWidget(self.clear_points_button)
         layout.addLayout(point_row, 3, 3)
 
@@ -378,6 +402,11 @@ class MainWindow(QMainWindow):
         self.stroke_mode_combo.currentIndexChanged.connect(self.on_stroke_mode_changed)
         self.stroke_mode_label.hide()
         self.stroke_mode_combo.hide()
+        self.roi_remove_white_checkbox.hide()
+        self.toggle_roi_mode_button.hide()
+        self.white_block_side_label.hide()
+        self.white_block_side_spin.hide()
+        self.toggle_roi_erase_button.hide()
 
         # 批量重命名专属控件（与 row 5 复用行，默认隐藏）
         self.rename_prefix_label = QLabel("文件前缀")
@@ -398,8 +427,11 @@ class MainWindow(QMainWindow):
         option_row = QHBoxLayout()
         option_row.addWidget(self.remove_white_checkbox)
         option_row.addWidget(self.remove_points_checkbox)
+        option_row.addWidget(self.roi_remove_white_checkbox)
         option_row.addWidget(self.resize_checkbox)
         option_row.addWidget(self.keep_name_checkbox)
+        option_row.addWidget(self.white_block_side_label)
+        option_row.addWidget(self.white_block_side_spin)
         option_row.addWidget(self.component_area_label)
         option_row.addWidget(self.component_area_spin)
         option_row.addWidget(self.stroke_mode_label)
@@ -426,11 +458,16 @@ class MainWindow(QMainWindow):
         self.output_button.clicked.connect(self.select_output_dir)
         self.image_button.clicked.connect(self.select_preview_image)
         self.toggle_stroke_mode_button.clicked.connect(self.toggle_stroke_mode)
+        self.toggle_roi_mode_button.clicked.connect(self.toggle_roi_mode)
+        self.toggle_roi_erase_button.clicked.connect(self.toggle_roi_erase_mode)
         self.start_button.clicked.connect(self.start_processing)
         self.clear_points_button.clicked.connect(self.clear_selected_points)
         self.preview_label.pressed.connect(self.on_preview_pressed)
         self.preview_label.moved.connect(self.on_preview_moved)
         self.preview_label.released.connect(self.on_preview_released)
+
+        # 程序启动时按当前模式刷新控件可见性
+        self.on_mode_changed(self.mode_combo.currentIndex())
 
         # 程序启动时自动加载默认输入目录的第一张图片
         default_input_dir = self.input_edit.text().strip()
@@ -455,6 +492,37 @@ class MainWindow(QMainWindow):
         self.toggle_stroke_mode_button.setText("关闭划线模式" if enabled else "开启划线模式")
         self.preview_label.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
         self._refresh_preview_scaled()
+
+    def toggle_roi_mode(self, checked):
+        self.roi_mode_enabled = checked
+        if not checked:
+            self.roi_drag_start = None
+            self.current_drag_roi = None
+        self._sync_roi_mode_ui()
+
+    def _sync_roi_mode_ui(self):
+        enabled = self.mode_combo.currentData() == "batch_process" and self.roi_mode_enabled
+        self.toggle_roi_mode_button.setChecked(enabled)
+        self.toggle_roi_mode_button.setText("关闭框选模式" if enabled else "开启框选模式")
+        self._sync_roi_erase_mode_ui()
+        self._refresh_preview_scaled()
+
+    def toggle_roi_erase_mode(self, checked):
+        self.roi_erase_enabled = checked
+        self._sync_roi_erase_mode_ui()
+
+    def _sync_roi_erase_mode_ui(self):
+        visible = self.mode_combo.currentData() == "batch_process" and self.roi_mode_enabled
+        self.toggle_roi_erase_button.setVisible(visible)
+        enabled = visible and self.roi_erase_enabled
+        self.toggle_roi_erase_button.setChecked(enabled)
+        self.toggle_roi_erase_button.setText("开启选区擦除" if enabled else "关闭选区擦除")
+        if enabled:
+            self.preview_label.setCursor(Qt.ForbiddenCursor)
+        elif visible:
+            self.preview_label.setCursor(Qt.CrossCursor)
+        else:
+            self.preview_label.setCursor(Qt.ArrowCursor)
 
     def on_frame_mode_changed(self, index):
         """抽帧方式切换时的回调"""
@@ -491,6 +559,13 @@ class MainWindow(QMainWindow):
             self.clear_points_button.setText("清除选点")
             self.toggle_stroke_mode_button.setChecked(False)
             self.stroke_mode_enabled = False
+            self.toggle_roi_mode_button.setChecked(False)
+            self.roi_mode_enabled = False
+            self.roi_erase_enabled = False
+            self.toggle_roi_erase_button.setChecked(False)
+            self.roi_drag_start = None
+            self.current_drag_roi = None
+            self._sync_roi_mode_ui()
             self._sync_stroke_mode_ui()
 
             # 显示输出目录行
@@ -506,6 +581,9 @@ class MainWindow(QMainWindow):
             self.stroke_mode_combo.setVisible(False)
             self.remove_white_checkbox.setVisible(True)
             self.remove_points_checkbox.setVisible(True)
+            self.roi_remove_white_checkbox.setVisible(True)
+            self.white_block_side_label.setVisible(True)
+            self.white_block_side_spin.setVisible(True)
             self.resize_checkbox.setVisible(True)
             self.keep_name_checkbox.setVisible(True)
             # 根据复选框状态显示/隐藏分辨率设置
@@ -516,6 +594,8 @@ class MainWindow(QMainWindow):
             self.resize_height_spin.setVisible(True)
             self.image_button.setVisible(True)
             self.toggle_stroke_mode_button.setVisible(False)
+            self.toggle_roi_mode_button.setVisible(True)
+            self.toggle_roi_erase_button.setVisible(self.roi_mode_enabled)
             self.clear_points_button.setVisible(True)
 
             # 隐藏视频抽帧相关控件
@@ -541,6 +621,13 @@ class MainWindow(QMainWindow):
             self.clear_points_button.setText("清除当前线")
             self.toggle_stroke_mode_button.setChecked(False)
             self.stroke_mode_enabled = False
+            self.toggle_roi_mode_button.setChecked(False)
+            self.roi_mode_enabled = False
+            self.roi_erase_enabled = False
+            self.toggle_roi_erase_button.setChecked(False)
+            self.roi_drag_start = None
+            self.current_drag_roi = None
+            self._sync_roi_mode_ui()
             self._sync_stroke_mode_ui()
 
             self._set_output_row_visible(True)
@@ -554,6 +641,9 @@ class MainWindow(QMainWindow):
             self.stroke_mode_combo.setVisible(True)
             self.remove_white_checkbox.setVisible(False)
             self.remove_points_checkbox.setVisible(False)
+            self.roi_remove_white_checkbox.setVisible(False)
+            self.white_block_side_label.setVisible(False)
+            self.white_block_side_spin.setVisible(False)
             self.resize_checkbox.setVisible(False)
             self.keep_name_checkbox.setVisible(False)
             self.resize_width_label.setVisible(False)
@@ -562,6 +652,8 @@ class MainWindow(QMainWindow):
             self.resize_height_spin.setVisible(False)
             self.image_button.setVisible(True)
             self.toggle_stroke_mode_button.setVisible(True)
+            self.toggle_roi_mode_button.setVisible(False)
+            self.toggle_roi_erase_button.setVisible(False)
             self.clear_points_button.setVisible(True)
 
             self.frame_mode_combo.setVisible(False)
@@ -600,6 +692,9 @@ class MainWindow(QMainWindow):
             self.stroke_mode_combo.setVisible(False)
             self.remove_white_checkbox.setVisible(False)
             self.remove_points_checkbox.setVisible(False)
+            self.roi_remove_white_checkbox.setVisible(False)
+            self.white_block_side_label.setVisible(False)
+            self.white_block_side_spin.setVisible(False)
             self.resize_checkbox.setVisible(False)
             self.keep_name_checkbox.setVisible(False)
             self.resize_width_label.setVisible(False)
@@ -608,6 +703,8 @@ class MainWindow(QMainWindow):
             self.resize_height_spin.setVisible(False)
             self.image_button.setVisible(False)
             self.toggle_stroke_mode_button.setVisible(False)
+            self.toggle_roi_mode_button.setVisible(False)
+            self.toggle_roi_erase_button.setVisible(False)
             self.clear_points_button.setVisible(False)
             # 隐藏重命名专属控件
             for w in [self.rename_prefix_label, self.rename_prefix_edit,
@@ -638,10 +735,11 @@ class MainWindow(QMainWindow):
                       self.component_area_label, self.component_area_spin,
                       self.stroke_mode_label, self.stroke_mode_combo,
                       self.remove_white_checkbox, self.remove_points_checkbox,
+                      self.roi_remove_white_checkbox, self.white_block_side_label, self.white_block_side_spin,
                       self.resize_checkbox, self.keep_name_checkbox,
                       self.resize_width_label, self.resize_width_spin,
                       self.resize_height_label, self.resize_height_spin,
-                      self.image_button, self.toggle_stroke_mode_button, self.clear_points_button]:
+                      self.image_button, self.toggle_stroke_mode_button, self.toggle_roi_mode_button, self.toggle_roi_erase_button, self.clear_points_button]:
                 w.setVisible(False)
             # 隐藏视频抽帧相关控件
             for w in [self.frame_mode_combo, self.frame_interval_label,
@@ -686,6 +784,14 @@ class MainWindow(QMainWindow):
             self.is_drawing_stroke = False
             self._refresh_preview_scaled()
             return
+        if mode == "batch_process" and self.roi_mode_enabled:
+            rois = self.white_roi_map.get(self.current_input_key)
+            if rois:
+                rois.clear()
+            self.roi_drag_start = None
+            self.current_drag_roi = None
+            self._refresh_preview_scaled()
+            return
         points = self.selected_points_map.get(self.current_input_key)
         if not points:
             return
@@ -706,6 +812,29 @@ class MainWindow(QMainWindow):
         if not self.current_input_key:
             return []
         return self.split_strokes_map.setdefault(self.current_input_key, [])
+
+    def _normalize_roi(self, start_point, end_point):
+        x1, y1 = start_point
+        x2, y2 = end_point
+        left = min(x1, x2)
+        top = min(y1, y2)
+        width = abs(x2 - x1) + 1
+        height = abs(y2 - y1) + 1
+        return left, top, width, height
+
+    def _rects_intersect(self, rect_a, rect_b):
+        ax, ay, aw, ah = rect_a
+        bx, by, bw, bh = rect_b
+        ar = ax + aw
+        ab = ay + ah
+        br = bx + bw
+        bb = by + bh
+        return not (ar <= bx or br <= ax or ab <= by or bb <= ay)
+
+    def _current_white_rois(self):
+        if not self.current_input_key:
+            return []
+        return self.white_roi_map.setdefault(self.current_input_key, [])
 
     def _preview_position_to_image_point(self, position):
         if not self.preview_display_rect or not self.current_image_size:
@@ -752,7 +881,17 @@ class MainWindow(QMainWindow):
             points.pop(nearest_index)
 
     def on_preview_clicked(self, position, button):
-        if self.mode_combo.currentData() == "object_slice":
+        mode = self.mode_combo.currentData()
+        if mode == "object_slice":
+            return
+        if mode == "batch_process" and self.roi_mode_enabled:
+            if button == Qt.RightButton and self.current_input_key:
+                rois = self.white_roi_map.get(self.current_input_key)
+                if rois:
+                    rois.pop()
+                self.current_drag_roi = None
+                self.roi_drag_start = None
+                self._refresh_preview_scaled()
             return
         point = self._preview_position_to_image_point(position)
         if point is None:
@@ -768,6 +907,17 @@ class MainWindow(QMainWindow):
 
     def on_preview_pressed(self, position, button):
         mode = self.mode_combo.currentData()
+        if mode == "batch_process" and self.roi_mode_enabled:
+            if button != Qt.LeftButton:
+                self.on_preview_clicked(position, button)
+                return
+            point = self._preview_position_to_image_point(position)
+            if point is None:
+                return
+            self.roi_drag_start = point
+            self.current_drag_roi = (point[0], point[1], 1, 1)
+            self._refresh_preview_scaled()
+            return
         if mode != "object_slice" or button != Qt.LeftButton:
             self.on_preview_clicked(position, button)
             return
@@ -781,7 +931,17 @@ class MainWindow(QMainWindow):
         self._refresh_preview_scaled()
 
     def on_preview_moved(self, position, button):
-        if self.mode_combo.currentData() != "object_slice":
+        mode = self.mode_combo.currentData()
+        if mode == "batch_process" and self.roi_mode_enabled:
+            if not self.roi_drag_start or button != Qt.LeftButton:
+                return
+            point = self._preview_position_to_image_point(position)
+            if point is None:
+                return
+            self.current_drag_roi = self._normalize_roi(self.roi_drag_start, point)
+            self._refresh_preview_scaled()
+            return
+        if mode != "object_slice":
             return
         if not self.stroke_mode_enabled:
             return
@@ -794,7 +954,28 @@ class MainWindow(QMainWindow):
         self._refresh_preview_scaled()
 
     def on_preview_released(self, position, button):
-        if self.mode_combo.currentData() != "object_slice" or button != Qt.LeftButton:
+        mode = self.mode_combo.currentData()
+        if mode == "batch_process" and self.roi_mode_enabled:
+            if button != Qt.LeftButton or not self.roi_drag_start:
+                return
+            point = self._preview_position_to_image_point(position)
+            if point is not None:
+                roi = self._normalize_roi(self.roi_drag_start, point)
+            else:
+                roi = self.current_drag_roi
+            self.roi_drag_start = None
+            self.current_drag_roi = None
+            if roi and self.current_input_key:
+                rois = self._current_white_rois()
+                if self.roi_erase_enabled:
+                    self.white_roi_map[self.current_input_key] = [
+                        existing for existing in rois if not self._rects_intersect(existing, roi)
+                    ]
+                else:
+                    rois.append(roi)
+            self._refresh_preview_scaled()
+            return
+        if mode != "object_slice" or button != Qt.LeftButton:
             return
         if not self.stroke_mode_enabled:
             return
@@ -926,6 +1107,8 @@ class MainWindow(QMainWindow):
 
         self.current_drag_stroke = None
         self.is_drawing_stroke = False
+        self.roi_drag_start = None
+        self.current_drag_roi = None
         self.preview_original_pixmap = None
         self.current_image_size = None
         self.current_input_path = None
@@ -967,6 +1150,7 @@ class MainWindow(QMainWindow):
             white_trigger = self.threshold_spin.value()
             color_tolerance = self.tolerance_spin.value()
             selected_points_snapshot = self._resolve_selected_points(input_dir)
+            white_roi_snapshot = self._resolve_white_rois(input_dir)
             if not selected_points_snapshot:
                 self.log_dialog.append("提示: 当前没有选点，未传入选点清理")
 
@@ -976,6 +1160,9 @@ class MainWindow(QMainWindow):
                 output_dir=output_dir,
                 white_trigger=white_trigger,
                 selected_points_map=selected_points_snapshot,
+                white_roi_map=white_roi_snapshot,
+                roi_remove_white=self.roi_remove_white_checkbox.isChecked(),
+                min_white_block_side=self.white_block_side_spin.value(),
                 color_tolerance=color_tolerance,
                 do_remove_white=self.remove_white_checkbox.isChecked(),
                 do_remove_points=self.remove_points_checkbox.isChecked(),
@@ -1087,6 +1274,32 @@ class MainWindow(QMainWindow):
     def _resolve_selected_points(self, input_dir):
         return {os.path.normpath(path): list(points) for path, points in self.selected_points_map.items() if points}
 
+    def _resolve_white_rois(self, input_dir):
+        if not input_dir or not os.path.isdir(input_dir):
+            return {}
+        resolved = {}
+        input_root = os.path.normpath(input_dir)
+        for path, rois in self.white_roi_map.items():
+            normalized_path = os.path.normpath(path)
+            if not rois:
+                continue
+            try:
+                if os.path.commonpath([normalized_path, input_root]) != input_root:
+                    continue
+            except ValueError:
+                continue
+            normalized_rois = []
+            for roi in rois:
+                if not roi:
+                    continue
+                x, y, w, h = roi
+                if w <= 0 or h <= 0:
+                    continue
+                normalized_rois.append((int(x), int(y), int(w), int(h)))
+            if normalized_rois:
+                resolved[normalized_path] = normalized_rois
+        return resolved
+
     def _resolve_merge_strokes(self, input_dir):
         if not input_dir or not os.path.isdir(input_dir):
             return {}
@@ -1187,6 +1400,18 @@ class MainWindow(QMainWindow):
                 painter.setPen(QColor(220, 50, 50))
                 for x, y in points:
                     painter.drawEllipse(QPoint(x, y), 4, 4)
+            roi_pen = QPen(QColor(50, 220, 120), 2)
+            roi_pen.setStyle(Qt.DashLine)
+            painter.setPen(roi_pen)
+            for roi in self._current_white_rois():
+                rx, ry, rw, rh = roi
+                painter.drawRect(rx, ry, rw, rh)
+            if self.current_drag_roi:
+                drag_pen = QPen(QColor(255, 90, 90) if self.roi_erase_enabled else QColor(255, 210, 80), 2)
+                drag_pen.setStyle(Qt.DashLine)
+                painter.setPen(drag_pen)
+                rx, ry, rw, rh = self.current_drag_roi
+                painter.drawRect(rx, ry, rw, rh)
 
         painter.end()
 
@@ -1218,6 +1443,22 @@ class MainWindow(QMainWindow):
             overlay_painter.setPen(QColor(255, 255, 255))
             overlay_painter.drawText(text_rect.adjusted(8, 0, -8, 0), Qt.AlignLeft | Qt.AlignVCenter, overlay_text)
             overlay_painter.end()
+        elif self.mode_combo.currentData() == "batch_process":
+            roi_text = "已开启" if self.roi_mode_enabled else "未开启"
+            erase_text = "擦除" if self.roi_erase_enabled else "新增"
+            remove_text = "启用" if self.roi_remove_white_checkbox.isChecked() else "关闭"
+            overlay_text = f"区域去白:{remove_text} 框选:{roi_text}/{erase_text} 选区:{len(self._current_white_rois())} 最小白块:{self.white_block_side_spin.value()}x{self.white_block_side_spin.value()}"
+            overlay_painter = QPainter(display_pixmap)
+            overlay_painter.setRenderHint(QPainter.Antialiasing, True)
+            metrics = overlay_painter.fontMetrics()
+            text_width = min(max(260, metrics.horizontalAdvance(overlay_text) + 20), max(40, display_pixmap.width() - 20))
+            text_rect = QRect(10, 10, text_width, 28)
+            overlay_painter.fillRect(text_rect, QColor(0, 0, 0, 160))
+            overlay_painter.setPen(QColor(255, 255, 255))
+            overlay_painter.drawText(text_rect.adjusted(8, 0, -8, 0), Qt.AlignLeft | Qt.AlignVCenter, overlay_text)
+            overlay_painter.end()
+            self.preview_label.setToolTip("")
+            self.preview_label.setStatusTip("")
         else:
             self.preview_label.setToolTip("")
             self.preview_label.setStatusTip("")
@@ -1286,8 +1527,14 @@ class MainWindow(QMainWindow):
                 self.merge_strokes_map[self.current_input_key] = []
             if self.current_input_key not in self.split_strokes_map:
                 self.split_strokes_map[self.current_input_key] = []
+            if self.current_input_key not in self.white_roi_map:
+                self.white_roi_map[self.current_input_key] = []
             self.current_drag_stroke = None
             self.is_drawing_stroke = False
+            self.roi_erase_enabled = False
+            self.toggle_roi_erase_button.setChecked(False)
+            self.roi_drag_start = None
+            self.current_drag_roi = None
         self._refresh_preview_scaled()
 
     def resizeEvent(self, event):

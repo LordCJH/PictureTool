@@ -176,7 +176,15 @@ def resize_to_fit(img, max_w, max_h):
     return cv2.resize(img, (new_w, new_h), interpolation=interp)
 
 
-def _remove_white_edges_from_image(img, white_trigger=235, selected_points=None, color_tolerance=5):
+def _remove_white_edges_from_image(
+    img,
+    white_trigger=235,
+    selected_points=None,
+    color_tolerance=5,
+    white_rois=None,
+    roi_remove_white=False,
+    min_white_block_side=2,
+):
     img = ensure_bgra(img)
     _clear_selected_points(img, selected_points, color_tolerance)
     h, w = img.shape[:2]
@@ -191,6 +199,40 @@ def _remove_white_edges_from_image(img, white_trigger=235, selected_points=None,
         255,
         0,
     ).astype(np.uint8)
+
+    if roi_remove_white and white_rois:
+        roi_mask = np.zeros((h, w), np.uint8)
+        for white_roi in white_rois:
+            if not white_roi:
+                continue
+            rx, ry, rw, rh = white_roi
+            rx = max(0, min(w - 1, int(rx)))
+            ry = max(0, min(h - 1, int(ry)))
+            rw = int(rw)
+            rh = int(rh)
+            if rw <= 0 or rh <= 0:
+                continue
+            right = min(w, rx + rw)
+            bottom = min(h, ry + rh)
+            if right <= rx or bottom <= ry:
+                continue
+            roi_mask[ry:bottom, rx:right] = 255
+
+        if not np.any(roi_mask):
+            return img
+
+        roi_white_mask = np.where((near_white_mask == 255) & (roi_mask == 255), 255, 0).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            roi_white_mask, connectivity=8
+        )
+        min_area = max(1, int(min_white_block_side)) ** 2
+        remove_mask = np.zeros((h, w), np.uint8)
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area >= min_area:
+                remove_mask[labels == label] = 255
+        img[remove_mask == 255] = [0, 0, 0, 0]
+        return img
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         near_white_mask, connectivity=8
@@ -463,6 +505,9 @@ def process_directory(
     output_dir,
     white_trigger=235,
     selected_points_map=None,
+    white_roi_map=None,
+    roi_remove_white=False,
+    min_white_block_side=2,
     color_tolerance=5,
     do_remove_white=True,
     do_remove_points=True,
@@ -492,6 +537,7 @@ def process_directory(
     total_count = len(input_files)
 
     selected_points_map = selected_points_map or {}
+    white_roi_map = white_roi_map or {}
 
     for index, (rel_path, input_path) in enumerate(input_files):
         if keep_original_name:
@@ -502,6 +548,7 @@ def process_directory(
         output_path = os.path.join(output_dir, output_rel)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         selected_points = selected_points_map.get(os.path.normpath(input_path))
+        white_rois = white_roi_map.get(os.path.normpath(input_path))
         ok = True
 
         img = read_image_unicode(input_path, cv2.IMREAD_UNCHANGED)
@@ -511,12 +558,18 @@ def process_directory(
             img = ensure_bgra(img)
 
             if do_remove_white:
-                img = _remove_white_edges_from_image(
-                    img,
-                    white_trigger=white_trigger,
-                    selected_points=selected_points,
-                    color_tolerance=color_tolerance,
-                )
+                if roi_remove_white and not white_rois:
+                    pass
+                else:
+                    img = _remove_white_edges_from_image(
+                        img,
+                        white_trigger=white_trigger,
+                        selected_points=selected_points,
+                        color_tolerance=color_tolerance,
+                        white_rois=white_rois,
+                        roi_remove_white=roi_remove_white,
+                        min_white_block_side=min_white_block_side,
+                    )
 
             if do_remove_points:
                 _clear_selected_points(img, selected_points, color_tolerance)
