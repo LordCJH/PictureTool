@@ -176,6 +176,18 @@ def resize_to_fit(img, max_w, max_h):
     return cv2.resize(img, (new_w, new_h), interpolation=interp)
 
 
+def _crop_to_nontransparent_bounds(img):
+    if img is None:
+        return img
+    img = ensure_bgra(img)
+    alpha = img[:, :, 3]
+    nonzero = cv2.findNonZero(alpha)
+    if nonzero is None:
+        return img
+    x, y, w, h = cv2.boundingRect(nonzero)
+    return img[y:y + h, x:x + w]
+
+
 def _remove_white_edges_from_image(
     img,
     white_trigger=235,
@@ -273,6 +285,7 @@ def remove_white_edges(input_path, output_path, white_trigger=235, selected_poin
         selected_points=selected_points,
         color_tolerance=color_tolerance,
     )
+    img = _crop_to_nontransparent_bounds(img)
 
     ok = write_image_unicode(output_path, img)
     if ok:
@@ -570,6 +583,7 @@ def process_directory(
                         roi_remove_white=roi_remove_white,
                         min_white_block_side=min_white_block_side,
                     )
+                    img = _crop_to_nontransparent_bounds(img)
 
             if do_remove_points:
                 _clear_selected_points(img, selected_points, color_tolerance)
